@@ -1,0 +1,75 @@
+# Safety Guard 配置文件
+#
+# 查找顺序：
+#   1. 环境变量 SAFETY_GUARD_CONFIG 指向的文件
+#   2. 安装根目录下的 safety_guard.toml（推荐，跟随 hook 一起迁移）
+#   3. ~/.agents/hooks/safety-guard/safety_guard.toml（默认安装位置）
+#   4. ~/.claude/hooks/safety_guard.toml（更老位置兜底）
+#
+# 所有字段都可省略，省略则用 config.py 里的默认值。
+# 修改后无需重启 CLI，下次 hook 调用即生效（每次启动重新加载）。
+#
+# 环境变量优先级高于本文件：
+#   SAFETY_GUARD_FAIL_OPEN=1  hook 报错时放行（默认 fail-closed）
+#   SAFETY_GUARD_DRY_RUN=1    永远 allow 但写审计（上线新规则前观察用）
+#   SAFETY_GUARD_NO_AUDIT=1  不写审计（pytest / --regression / 手工回放专用）
+#   SAFETY_GUARD_IGNORE_DISABLED_RULES=1  忽略下面的 disabled_rules（测试用）
+# 临时禁用某条规则（不需要时留空数组）
+disabled_rules = ["file-critical-path-write"]
+#disabled_rules = []
+
+# git push --force 拦截的保护分支
+protected_branches = ["main", "master", "release/*"]
+
+# 指令区路径（只豁免读取，写入仍需 ask）
+# 后两项是包管理器的本地缓存：查依赖 jar / 源码属于日常只读操作，日志里
+# `find ~/.m2/repository`、`ls ~/.m2/...` 是残留误报的主要来源；放进来后
+# 读放行、写（rm / cp 进去）仍然 ask。
+read_only_zones = [
+  "~/.claude", "~/.agents", "~/.codex",
+  "~/.m2/repository", "~/.gradle/caches",
+]
+
+# 只读命令白名单（这些命令读 CWD 外路径只 ask 不 deny）
+read_only_commands = [
+  "cat", "rg", "grep", "find", "ls", "head", "tail", "wc", "stat", "file",
+  "sed", "awk",
+  # 纯读/纯查询：不加进来的话泛化路径规则会把它们当写入
+  "nl", "tree", "diff", "jq", "yq", "du", "df", "realpath", "readlink",
+  "basename", "dirname", "which", "type", "column", "sort", "uniq", "cut",
+  "less", "more", "od", "xxd", "hexdump", "strings",
+  "md5", "md5sum", "shasum", "sha1sum", "sha256sum", "cksum",
+]
+
+# 前缀包装命令：剥掉后按内层真命令分发规则。
+# 不剥的话 `rtk rm -rf /`、`sudo rm -rf /`、`env A=1 rm -rf /` 会绕过全部
+# 按命令名匹配的规则（audit 显示 codex 侧 80% 的命令带 rtk 前缀）。
+wrapper_commands = [
+  "rtk", "sudo", "doas", "env", "nohup", "command", "builtin", "exec",
+  "nice", "ionice", "stdbuf", "time", "timeout", "xargs", "setsid",
+  "proxychains", "proxychains4",
+]
+
+# 高危覆写保护：任何 bash 命令试图写入这些路径直接 deny
+# 默认会自动保护 hook 自身（入口脚本 + safety_guard 包目录），下面是各 CLI 的额外保护：
+critical_paths = [
+  "~/.claude/settings.json",
+  "~/.codex/config.toml",
+]
+
+# 行为开关
+fail_open = false
+
+dry_run = false
+
+# 审计日志（默认在安装根目录下的 audit/）
+# audit_dir = "~/.agents/hooks/safety-guard/audit"
+audit_retention_days = 7
+audit_max_file_mb = 5
+audit_max_total_mb = 50
+
+# === 表结构字段必须放在文件末尾 ===
+
+# 调整某条规则的严重度，把 medium 升 high 或反之
+[severity_overrides]
+# bash-rm-targeted = "high"

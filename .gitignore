@@ -1,0 +1,62 @@
+# 系统 / 编辑器
+.DS_Store
+*.swp
+*~
+.idea/
+.vscode/
+*.code-workspace
+
+# 凭据 / 本地密钥
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+.token_cache
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+.eggs/
+dist/
+build/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+
+# 审计日志（含本机路径与命令历史，禁止入库）
+audit/
+audit-*.jsonl
+*.jsonl
+
+# 本地调试 / 回放产物
+/tmp-replay*
+*.replay.json
+.before.json
+.after.json
+
+# 本地配置覆盖（勿提交本机路径）
+safety_guard.local.toml
+settings.local.json
+
+# Claude
+.claude
+
+# 压缩与备份
+*.log
+*.tmp
+*.bak
+*.orig
+*~
