@@ -31,7 +31,7 @@ def _claude_input(tool: str, tool_input: Any, cwd: Path) -> dict[str, Any]:
 
 
 def test_registry_contains_builtin_adapters():
-    assert available() == ["claude", "codex-permission", "codex-pretool"]
+    assert available() == ["claude", "codex-permission", "codex-pretool", "grok"]
 
 
 def test_registry_selects_canonical_environment(monkeypatch: pytest.MonkeyPatch):

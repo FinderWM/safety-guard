@@ -4,7 +4,7 @@
 
 它不是 OS sandbox，也不替代人工审查。目标是把「误删家目录 / force-push main / 管道执行远端脚本 / 改掉 hook 自身」等高代价失误，在 Hook 层挡下来或强制二次确认。
 
-当前内置 **Claude Code** 与 **Codex** 适配器，**30** 条规则、同一套引擎。
+当前内置 **Claude Code**、**Codex** 与 **Grok** 适配器，**30** 条规则、同一套引擎。
 
 ## 它做什么
 
@@ -43,6 +43,7 @@
 | `claude`（默认） | Claude Code `PreToolUse` | `Bash` / `Write` / `Edit` / `NotebookEdit` |
 | `codex-pretool` | Codex `PreToolUse` | `Bash`/`shell`、`apply_patch` |
 | `codex-permission` | Codex `PermissionRequest` | 同上 |
+| `grok` | Grok `pre_tool_use` / `PreToolUse` | `run_terminal_command`、`search_replace`（及 Bash/Write/Edit 别名） |
 
 选择优先级：`--adapter` 参数 → 环境变量 `SAFETY_GUARD_ADAPTER` → 默认 `claude`。
 
@@ -105,6 +106,20 @@ python3 /path/to/safety-guard/safety-guard.py --adapter codex-permission
 ```
 
 （具体挂载字段以你使用的 Codex Hook 配置为准；stdin 需为平台原生 JSON。）
+
+### 接入 Grok
+
+在 `~/.grok/config.toml`（或 `~/.grok/hooks/*.json`）注册 `PreToolUse`，**必须**指定 `--adapter grok`（默认 `claude` 认不出 Grok 的事件名/工具名，会静默放行）：
+
+```toml
+[[hooks.PreToolUse]]
+matcher = "Bash|Write|Edit|run_terminal_command|search_replace"
+hooks = [
+  { type = "command", command = "python3 /path/to/safety-guard/safety-guard.py --adapter grok", timeout = 10 },
+]
+```
+
+Grok 侧 `ask`（medium）会升为顶层 `{"decision":"deny","reason":"..."}`，因为 PreToolUse 没有 Claude 式确认 UI。
 
 ### 立刻试一次
 

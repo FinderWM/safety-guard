@@ -6,6 +6,7 @@ import os
 from .base import Adapter
 from .claude import ClaudeAdapter
 from .codex import CodexAdapter
+from .grok import GrokAdapter
 
 
 _DEFAULT = "claude"
@@ -39,3 +40,4 @@ def select(name: str | None = None) -> Adapter:
 register(ClaudeAdapter())
 register(CodexAdapter(name="codex-pretool", event="PreToolUse"))
 register(CodexAdapter(name="codex-permission", event="PermissionRequest"))
+register(GrokAdapter())

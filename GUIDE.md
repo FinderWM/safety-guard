@@ -69,6 +69,7 @@ safety_guard/
 │   ├── base.py          # Adapter Protocol
 │   ├── claude.py
 │   ├── codex.py         # PreToolUse + PermissionRequest + apply_patch 解析
+│   ├── grok.py          # Grok pre_tool_use / 顶层 decision
 │   └── registry.py
 ├── rules/
 │   ├── base.py
@@ -89,6 +90,7 @@ safety_guard/
 tests/
 ├── rules/               # 规则与分析器回归
 ├── codex/               # Codex Adapter / apply_patch / hook 协议
+├── grok/                # Grok Adapter / 原生 payload
 ├── fixtures/regression_commands.txt
 ├── test_runner.py
 └── test_paths.py
@@ -203,13 +205,14 @@ command
 
 ## Adapter 注册与选择
 
-三个内置 Adapter 集中注册在 `safety_guard/adapters/registry.py`：
+内置 Adapter 集中注册在 `safety_guard/adapters/registry.py`：
 
 | Adapter 名 | 平台事件 | 输入工具 |
 | --- | --- | --- |
 | `claude` | Claude Code `PreToolUse` | `Bash` / `Write` / `Edit` / `NotebookEdit` |
 | `codex-pretool` | Codex `PreToolUse` | `Bash`/`shell` + `apply_patch` |
 | `codex-permission` | Codex `PermissionRequest` | 同上 |
+| `grok` | Grok `pre_tool_use` / `PreToolUse` | `run_terminal_command` / `search_replace`（及 Bash/Write/Edit 别名） |
 
 选择优先级：
 
@@ -222,6 +225,7 @@ command
 ```bash
 python3 safety-guard.py --adapter codex-pretool
 python3 safety-guard.py --adapter codex-permission
+python3 safety-guard.py --adapter grok
 ```
 
 ### Claude 渲染
@@ -235,6 +239,13 @@ python3 safety-guard.py --adapter codex-permission
 - `ask` → `systemMessage`（提示，不硬拦）
 - `deny` + PreToolUse → `permissionDecision: deny`
 - `deny` + PermissionRequest → `decision.behavior: deny`
+
+### Grok 渲染
+
+- `allow` → `{"decision": "allow"}`
+- `ask` / `deny` → `{"decision": "deny", "reason": "..."}`（无 ask UI，medium 升 deny）
+- 输入兼容 camelCase（`hookEventName` / `toolName` / `toolInput`）与 snake_case
+- `search_replace`：空 `old_string` → 内部 `Write`；非空 → 内部 `Edit`
 
 ### Codex `apply_patch` → 多 Operation
 
