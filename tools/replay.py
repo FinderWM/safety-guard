@@ -15,9 +15,10 @@
     python3 tools/replay.py --compare /tmp/before.json --rule bash-env-subversion
 
 保真度限制（会在报告里显式说明，不静默丢弃）：
-  - cmd_preview 截断在 500 字符（尾部 `…`），截断样本无法逐字复现
-  - 预览把换行压成空格，多行命令丢失行边界，shlex 回退路径的判定会失真
+  - 优先 cmd_body（完整脱敏正文）；旧日志或超长命令只有 cmd_preview
+  - cmd_truncated=true / preview 以 `…` 结尾的样本无法逐字复现，默认跳过
   - 存在性依赖规则（*-overwrite-existing）依赖当时的磁盘状态，现已漂移
+  - 对比时优先 engine_decision（兼容旧 decision / dry-run-* 前缀）
 """
 from __future__ import annotations
 
@@ -39,7 +40,7 @@ from safety_guard import engine  # noqa: E402
 from safety_guard.adapters.registry import get  # noqa: E402
 from safety_guard.config import load as load_config  # noqa: E402
 
-TRUNCATION_SUFFIX = "…"
+from safety_guard.audit import TRUNCATION_SUFFIX  # noqa: E402
 
 # 决策依赖当时磁盘状态，回放必然分歧——默认排除，--include-existence 可保留
 EXISTENCE_DEPENDENT = frozenset({
@@ -64,6 +65,25 @@ def _fixture_commands() -> set[str]:
     return out
 
 
+
+def _command_text(rec: dict) -> str:
+    """回放用命令：优先完整 cmd_body，回退 cmd_preview。"""
+    body = rec.get("cmd_body")
+    if isinstance(body, str) and body:
+        return body
+    prev = rec.get("cmd_preview") or ""
+    return prev if isinstance(prev, str) else ""
+
+
+def _recorded_decision(rec: dict) -> str:
+    """对比基线用的引擎决策（去掉 dry-run- 前缀）。"""
+    eng = rec.get("engine_decision")
+    if eng in ("allow", "ask", "deny"):
+        return eng
+    d = str(rec.get("decision") or "?")
+    return d.removeprefix("dry-run-")
+
+
 def load_records(audit_dir: Path, *, include_fixture: bool = False) -> tuple[list[dict], Counter]:
     """读取审计记录，返回 (可回放记录, 跳过原因统计)。"""
     fixture = set() if include_fixture else _fixture_commands()
@@ -83,11 +103,11 @@ def load_records(audit_dir: Path, *, include_fixture: bool = False) -> tuple[lis
             if rec.get("tool") != "Bash":
                 skipped[f"non-bash-tool:{rec.get('tool')}"] += 1
                 continue
-            cmd = rec.get("cmd_preview") or ""
+            cmd = _command_text(rec)
             if not cmd:
                 skipped["empty-preview"] += 1
                 continue
-            if cmd.endswith(TRUNCATION_SUFFIX):
+            if rec.get("cmd_truncated") or cmd.endswith(TRUNCATION_SUFFIX):
                 skipped["truncated-preview"] += 1
                 continue
             if cmd in fixture:
@@ -96,6 +116,8 @@ def load_records(audit_dir: Path, *, include_fixture: bool = False) -> tuple[lis
             if not rec.get("cwd"):
                 skipped["missing-cwd"] += 1
                 continue
+            # 规范化供回放使用的命令字段
+            rec = {**rec, "_replay_cmd": cmd}
             records.append(rec)
     return records, skipped
 
@@ -104,7 +126,7 @@ def _stdin_for(rec: dict) -> dict:
     return {
         "hook_event_name": "PreToolUse",
         "tool_name": "Bash",
-        "tool_input": {"command": rec["cmd_preview"]},
+        "tool_input": {"command": rec.get("_replay_cmd") or _command_text(rec)},
         "cwd": rec["cwd"],
     }
 
@@ -124,10 +146,12 @@ def evaluate_all(records: list[dict]) -> list[dict]:
             decision = f"ERROR:{type(e).__name__}"
             reason = str(e)
         out.append({
-            "cmd": rec["cmd_preview"],
+            "cmd": rec.get("_replay_cmd") or _command_text(rec),
             "cwd": rec["cwd"],
-            "recorded": rec.get("decision", "?"),
+            "recorded": _recorded_decision(rec),
+            "recorded_rendered": rec.get("rendered_decision"),
             "replayed": decision,
+            "adapter": rec.get("adapter") or rec.get("harness"),
             "rules": sorted({m.get("id", "") for m in (rec.get("matches") or [])}),
             "reason": reason[:400],
         })

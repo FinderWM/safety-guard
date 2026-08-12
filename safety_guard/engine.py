@@ -4,9 +4,9 @@ from __future__ import annotations
 import traceback
 from typing import Any
 
-from . import audit, context
 from .config import Config
 from .contracts import Decision, DecisionResult, NormalizedRequest
+from . import context
 from .rules.base import RuleMatch
 from .rules.registry import iter_rules_for_tool
 
@@ -55,34 +55,14 @@ def _decide(matches: list[RuleMatch]) -> tuple[Decision, str | None]:
 
 def _internal_result(reason: str, cfg: Config) -> DecisionResult:
     if cfg.fail_open:
-        return DecisionResult("allow")
-    return DecisionResult("deny", f"[INTERNAL:safety-guard] {reason}")
-
-
-def _write_internal_audit(
-    *,
-    cfg: Config,
-    adapter: str,
-    tool: str,
-    cwd: str,
-    raw_input: str,
-    reason: str,
-    error_type: str,
-) -> None:
-    try:
-        audit.write(
-            tool=tool,
-            cwd=cwd,
-            raw_input=raw_input,
-            matches=[],
-            decision="dry-run-deny" if cfg.dry_run else "deny",
-            adapter=adapter,
-            error_type=error_type,
-            error_detail=reason,
-            config=cfg,
-        )
-    except Exception:
-        pass
+        return DecisionResult("allow", engine_decision="allow")
+    return DecisionResult(
+        "deny",
+        f"[INTERNAL:safety-guard] {reason}",
+        engine_decision="deny",
+        error_type="internal",
+        error_detail=reason,
+    )
 
 
 def _collect_matches(tool: str, ctx, cfg: Config) -> list[RuleMatch]:
@@ -94,7 +74,7 @@ def _collect_matches(tool: str, ctx, cfg: Config) -> list[RuleMatch]:
             tb = traceback.format_exc(limit=2)
             matches.append(RuleMatch(
                 rule_id=rule.id,
-                severity="high",  # 规则崩溃→fail-closed 当 high 处理
+                severity="high",
                 reason=f"规则 {rule.id} 执行异常：{e}",
                 extra={"traceback": tb},
             ))
@@ -105,7 +85,10 @@ def _collect_matches(tool: str, ctx, cfg: Config) -> list[RuleMatch]:
 
 
 def evaluate(request: NormalizedRequest, cfg: Config) -> DecisionResult:
-    """检查请求中的全部操作，并聚合为一个统一决策。"""
+    """检查请求中的全部操作，并聚合为一个统一决策。
+
+    不写审计：由 runner 在 render 之后统一落盘（才能记 rendered_decision）。
+    """
     matches: list[RuleMatch] = []
     for operation in request.operations:
         try:
@@ -117,35 +100,32 @@ def evaluate(request: NormalizedRequest, cfg: Config) -> DecisionResult:
             if cfg.fail_open:
                 continue
             reason = _bash_parse_reason(ctx.parse_error)
-            _write_internal_audit(
-                cfg=cfg,
-                adapter=request.adapter,
-                tool=operation.tool,
-                cwd=str(ctx.cwd),
-                raw_input=ctx.raw_command,
-                reason=reason,
+            detail = f"[INTERNAL:safety-guard] {reason}"
+            return DecisionResult(
+                "deny",
+                detail,
+                engine_decision="deny",
                 error_type="bash_parse_error",
+                error_detail=reason,
             )
-            return _internal_result(reason, cfg)
 
         matches.extend(_collect_matches(operation.tool, ctx, cfg))
 
     matches = _apply_severity_overrides(matches, cfg)
     decision, reason = _decide(matches)
-
-    try:
-        audit.write(
-            tool=request.tool,
-            cwd=request.cwd,
-            raw_input=request.audit_input,
-            matches=[_match_to_audit(match) for match in matches],
-            decision="dry-run-" + decision if cfg.dry_run else decision,
-            adapter=request.adapter,
-            config=cfg,
-        )
-    except Exception:
-        pass
+    audit_matches = tuple(_match_to_audit(m) for m in matches)
 
     if cfg.dry_run:
-        return DecisionResult("allow")
-    return DecisionResult(decision, reason)
+        # 平台侧放行，审计仍记录真实引擎结论
+        return DecisionResult(
+            "allow",
+            reason,
+            engine_decision=decision,
+            audit_matches=audit_matches,
+        )
+    return DecisionResult(
+        decision,
+        reason,
+        engine_decision=decision,
+        audit_matches=audit_matches,
+    )

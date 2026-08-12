@@ -267,6 +267,24 @@ python3 safety-guard.py --adapter grok
 
 `file-patch-delete` 仅在 `patch_action=delete` 时 ask。
 
+## 审计字段（优化拦截）
+
+每次真实 Hook（未设 `SAFETY_GUARD_NO_AUDIT`）在 **render 之后** 写一行 jsonl：
+
+| 字段 | 含义 |
+| --- | --- |
+| `adapter` | 平台适配器（`claude` / `grok` / `codex-*`） |
+| `engine_decision` | 规则引擎结论 `allow`/`ask`/`deny` |
+| `rendered_decision` | 写入平台后的对外结论（如 Grok 将 ask 升为 deny） |
+| `decision` | 兼容旧字段，等于 `engine_decision`（`dry_run` 时带 `dry-run-` 前缀） |
+| `cmd_body` | 脱敏后的完整输入（≤8192 字符时存在，供精确回放） |
+| `cmd_truncated` | 超长为 true，此时仅有 `cmd_preview` |
+| `cmd_preview` | 预览（保留换行；超长截断到 4096+…） |
+| `hook_event` | 规范化事件名 |
+| `matches` | 命中规则 id/severity/reason/extra |
+
+`tools/replay.py` 优先用 `cmd_body`，并与 `engine_decision` 对比。
+
 ## 接入新平台
 
 如果新平台可以映射到现有 Operation，只需新增 Adapter。
