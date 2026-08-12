@@ -3,7 +3,8 @@
 覆盖：
   - inline-script：`bash -c "$(gen)"` / `eval "$(…)"` / `python3 -c "$(gen)"`
   - placeholder：`xargs -I{} sh -c '{}'`——字面 `{}` 运行时才填，禁止再 parse
-  - process-subst：`bash <(curl …)` / `source <(…)`——脚本本体是进程替换
+  - process-subst：`bash <(curl …)` / `bash < <(…)` / `source <(…)`
+  - stdin-script：`bash -s < …` / `source /dev/stdin <<< "$(…)"`
 
 find-exec 由收集器标记，但 ask 交给 bash-find-exec-rm（仅 rm 家族），
 避免 `find -exec grep` 被本规则误伤。
@@ -17,7 +18,7 @@ from .base import Rule, RuleMatch
 from .registry import register
 
 # find-exec 只作结构标记，不在此规则触发 ask
-_ACTIVE_KINDS = frozenset({"inline-script", "placeholder", "process-subst"})
+_ACTIVE_KINDS = frozenset({"inline-script", "placeholder", "process-subst", "stdin-script"})
 
 
 def _format_payload(p) -> str:
@@ -26,6 +27,8 @@ def _format_payload(p) -> str:
         return f"{p.shell} -c {p.raw}（占位符，运行时填充）"
     if kind == "process-subst":
         return f"{p.shell} 以进程替换为脚本源：{p.raw}"
+    if kind == "stdin-script":
+        return f"{p.shell} 从 stdin/here-string 读脚本：{p.raw}"
     if p.shell == "eval":
         return f"eval {p.raw}"
     return f"{p.shell} -c {p.raw}"

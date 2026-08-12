@@ -11,6 +11,23 @@ from .adapters.registry import select
 from .config import Config, load as load_config
 from .contracts import DecisionResult
 
+# 各平台 PreToolUse 族事件：adapter 未认领时不应静默放行（否则错 adapter 会放行 rm -rf /）。
+_PRETOOL_EVENTS = frozenset({
+    "PreToolUse",
+    "pre_tool_use",
+    "PermissionRequest",
+    "permission_request",
+})
+
+
+def _looks_like_pretool(stdin_json: dict[str, Any]) -> bool:
+    event = stdin_json.get("hook_event_name") or stdin_json.get("hookEventName")
+    if not isinstance(event, str) or event not in _PRETOOL_EVENTS:
+        return False
+    tool = stdin_json.get("tool_name") or stdin_json.get("toolName")
+    return isinstance(tool, str) and bool(tool.strip())
+
+
 
 def _internal_result(reason: str, cfg: Config) -> DecisionResult:
     if cfg.fail_open:
@@ -32,6 +49,15 @@ def run(
     except Exception as e:
         return selected.render(_internal_result(f"hook 输入解析失败：{e}", cfg))
     if request is None:
+        if _looks_like_pretool(stdin_json):
+            return selected.render(
+                _internal_result(
+                    f"adapter={selected.name!r} 未识别此 PreToolUse 载荷"
+                    f"（事件/工具与适配器不匹配）。请检查 --adapter / "
+                    f"SAFETY_GUARD_ADAPTER 是否与当前 CLI 一致。",
+                    cfg,
+                )
+            )
         return {}
     return selected.render(engine.evaluate(request, cfg))
 

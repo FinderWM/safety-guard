@@ -58,6 +58,9 @@ class BashOutsideCwdRead(Rule):
             else:
                 for w in iter_read_sources(cmd.name, cmd.args, read_only):
                     consider(w)
+            # wrapper 继承读源（xargs -a FILE 剥层后挂在 extra_reads）
+            for w in getattr(cmd, "extra_reads", None) or []:
+                consider(w)
 
         for w in iter_read_redirect_targets(ctx.ast.redirects):
             consider(w)

@@ -95,6 +95,8 @@ class BashUnresolvablePath(Rule):
                     consider(w)
                 for w in iter_write_targets(cmd.name, cmd.args, read_only):
                     consider(w)
+            for w in getattr(cmd, "extra_reads", None) or []:
+                consider(w)
 
         for w in iter_read_redirect_targets(ctx.ast.redirects):
             consider(w)

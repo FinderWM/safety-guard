@@ -147,10 +147,10 @@ class CodexAdapter:
         )
 
     def render(self, result: DecisionResult) -> dict[str, Any]:
+        # Codex PreToolUse/PermissionRequest 均无可靠的「ask 再确认」闸门可依赖：
+        # medium 若只回 systemMessage 会被静默放行。与 Grok 对齐：ask 升 deny。
         if result.decision == "allow":
             return {}
-        if result.decision == "ask":
-            return {"systemMessage": result.reason} if result.reason else {}
         if self.event == _PRETOOL_EVENT:
             output: dict[str, Any] = {
                 "hookSpecificOutput": {

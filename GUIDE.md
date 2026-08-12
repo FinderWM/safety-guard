@@ -74,7 +74,7 @@ safety_guard/
 ├── rules/
 │   ├── base.py
 │   ├── registry.py      # 按模块名字典序显式 import 并 @register
-│   └── <rule>.py        # 当前 30 条
+│   └── <rule>.py        # 当前 35 条
 ├── contracts.py         # Operation / NormalizedRequest / DecisionResult
 ├── runner.py            # stdin ↔ Adapter ↔ Engine
 ├── engine.py            # 聚合决策 + 审计
@@ -199,6 +199,13 @@ command
 要点：
 
 - **Wrapper 等价**：`rtk rm -rf /` 与 `rm -rf /` 同级拦截；任意 wrapper 可携带 `NAME=VALUE`。
+- **argv0 规范化**：`helpers.normalize_cmd_name` 去掉 `/usr/bin/` 等前缀；AST 的 `CommandSpec.name` 在构建时已是裸名，`/bin/rm` 与 `rm` 同级匹配。
+- **管道执行端**：`bash-pipe-to-shell` 终点含 shell、`busybox sh`、以及 python/node 等 `EXEC_INTERPRETERS`；起点含 curl/wget/nc 等（经 basename）。
+- **stdin 拉码**：`bash -s < <(curl…)` / `zsh <(curl…)` / `source /dev/stdin <<< "$(curl…)"` → `bash-remote-stdin-exec`（high）；无网络字面时归 opaque。
+- **`-c` 混淆**：`$'-c'` 等 ANSI-C 选项经 source 切片 + expand 后再识别；`env -S '…'` 字面载荷再 shlex 拆词。
+- **outside 脚本执行**：`bash /out/x.sh`、`python3 /out/x.py` → `bash-outside-script-exec`。
+- **审计/理由脱敏**：`redact_user_paths` 把真实家目录打成 `$HOME`，避免 jsonl/确认框泄漏用户名路径。
+- **busybox/toybox 多调用**：`unwrap` 后剥成真实 applet（`busybox cat` → `cat`）；`xargs -a FILE` 继承读源。
 - **折叠失败诚实**：算不出的 word `folded=None`，由 `bash-unresolvable-path` 等规则消费，不退回原文假装安全。
 - **路径分类**：`in-cwd` / `instruction-zone` / `outside`；CWD 内 symlink 按链接位置算 in-cwd。
 - **Parse 失败**：`parse_error` 非空时 Engine 默认 fail-closed → `deny`（可 `SAFETY_GUARD_FAIL_OPEN=1`）。
@@ -212,7 +219,7 @@ command
 | `claude` | Claude Code `PreToolUse` | `Bash` / `Write` / `Edit` / `NotebookEdit` |
 | `codex-pretool` | Codex `PreToolUse` | `Bash`/`shell` + `apply_patch` |
 | `codex-permission` | Codex `PermissionRequest` | 同上 |
-| `grok` | Grok `pre_tool_use` / `PreToolUse` | `run_terminal_command` / `search_replace`（及 Bash/Write/Edit 别名） |
+| `grok` | Grok `pre_tool_use` / `PreToolUse` | `run_terminal_command` / `write` / `search_replace`（及 Bash/Write/Edit 别名） |
 
 选择优先级：
 
@@ -236,9 +243,8 @@ python3 safety-guard.py --adapter grok
 ### Codex 渲染
 
 - `allow` → `{}`
-- `ask` → `systemMessage`（提示，不硬拦）
-- `deny` + PreToolUse → `permissionDecision: deny`
-- `deny` + PermissionRequest → `decision.behavior: deny`
+- `ask` / `deny` + PreToolUse → `permissionDecision: deny`（medium 升 deny，避免只提示不拦）
+- `ask` / `deny` + PermissionRequest → `decision.behavior: deny`
 
 ### Grok 渲染
 
@@ -246,6 +252,7 @@ python3 safety-guard.py --adapter grok
 - `ask` / `deny` → `{"decision": "deny", "reason": "..."}`（无 ask UI，medium 升 deny）
 - 输入兼容 camelCase（`hookEventName` / `toolName` / `toolInput`）与 snake_case
 - `search_replace`：空 `old_string` → 内部 `Write`；非空 → 内部 `Edit`
+- 原生工具名 `write`（小写）映射为内部 `Write`
 
 ### Codex `apply_patch` → 多 Operation
 
@@ -369,7 +376,7 @@ class ExampleRule(Rule):
 `ctx.classify()`；文件工具用 `ctx.target_path` / `ctx.classification` /
 `ctx.file_exists` / `ctx.patch_action`。共用逻辑放 `helpers.py`，不要在规则里重解析命令。
 
-### 当前规则一览（30）
+### 当前规则一览（35）
 
 `python3 safety-guard.py --list-rules` 可打印完整描述。
 
@@ -383,7 +390,8 @@ class ExampleRule(Rule):
 | `bash-find-delete-unbounded` | Bash | `find /` 或 `find ~` + `-delete` / `-exec rm` |
 | `bash-git-push-force-protected` | Bash | `git push --force` 到保护分支 |
 | `bash-interpreter-shell-escape` | Bash | 解释器内联载荷里再调 shell |
-| `bash-pipe-to-shell` | Bash | `curl\|sh` 等管道执行 |
+| `bash-pipe-to-shell` | Bash | `curl\|sh` / `curl\|/bin/bash` / `curl\|python3` / `nc\|bash` 等管道执行 |
+| `bash-remote-stdin-exec` | Bash | shell/source 从 stdin/进程替换执行且含网络抓取 |
 | `bash-rm-root-or-home` | Bash | `rm` 目标为 `/` 或 `$HOME` |
 | `bash-sql-drop-database` | Bash | `DROP DATABASE` / `DROP SCHEMA` |
 | `file-critical-path-write` | Write/Edit/NotebookEdit | 写入 critical_paths |
@@ -393,16 +401,20 @@ class ExampleRule(Rule):
 | id | 工具 | 摘要 |
 | --- | --- | --- |
 | `bash-cp-mv-overwrite-existing` | Bash | `cp`/`mv` 覆盖已存在目标 |
+| `bash-credential-export` | Bash | gpg/security/kubectl 等凭据导出或密钥读取 |
 | `bash-find-exec-rm` | Bash | 非根/家起点 `find -exec/-execdir` + rm 家族 |
 | `bash-gh-close` | Bash | `gh` 关闭/删除远端资源 |
 | `bash-git-destructive` | Bash | `reset --hard` / `clean -f` / `branch -D` 等 |
 | `bash-instruction-zone-write` | Bash | 写指令区 |
-| `bash-opaque-inline-script` | Bash | 内联/占位/进程替换，内层静态不可见 |
+| `bash-interpreter-remote-exec` | Bash | 解释器载荷同时网络取指 + exec/eval |
+| `bash-interpreter-outside-path` | Bash | 解释器 -c/-e 字面量越界路径 |
+| `bash-opaque-inline-script` | Bash | 内联/占位/进程替换/stdin 脚本，内层静态不可见 |
 | `bash-outside-cwd-read` | Bash | 读 CWD 外（指令区只读豁免） |
 | `bash-outside-cwd-write` | Bash | 非只读命令碰 CWD 外 |
+| `bash-outside-script-exec` | Bash | shell/解释器执行 CWD 外脚本文件 |
 | `bash-redirect-overwrite-existing` | Bash | `>` 覆盖已存在文件 |
 | `bash-rm-targeted` | Bash | 非根/家的 `rm` |
-| `bash-sensitive-path-scan` | Bash | 敏感路径/密钥字面量 |
+| `bash-sensitive-path-scan` | Bash | 敏感路径/密钥字面量（含 expand 候选） |
 | `bash-sql-delete-truncate` | Bash | `DELETE` / `TRUNCATE` |
 | `bash-symlink-create` | Bash | `ln` / `ln -s` / `cp -s` |
 | `bash-tee-overwrite-existing` | Bash | 无 `-a` 的 `tee` |

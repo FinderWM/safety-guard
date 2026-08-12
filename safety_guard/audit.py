@@ -105,8 +105,21 @@ def _digest(cmd: str) -> str:
 
 
 def _preview(cmd: str, n: int = 500) -> str:
-    s = cmd.replace("\n", " ").strip()
+    from .helpers import redact_user_paths
+    s = redact_user_paths(cmd.replace("\n", " ").strip())
     return s if len(s) <= n else s[:n] + "…"
+
+
+def _redact_matches(matches: list[dict]) -> list[dict]:
+    """审计里的 reason 也做家目录脱敏，避免 jsonl 落盘真实用户路径。"""
+    from .helpers import redact_user_paths
+    out: list[dict] = []
+    for m in matches:
+        mm = dict(m)
+        if isinstance(mm.get("reason"), str):
+            mm["reason"] = redact_user_paths(mm["reason"])
+        out.append(mm)
+    return out
 
 
 def write(
@@ -132,22 +145,24 @@ def write(
 
     _maybe_prune(audit_dir, cfg)
 
+    from .helpers import redact_user_paths
+
     record = {
         "ts": _dt.datetime.now(_dt.timezone.utc).astimezone().isoformat(timespec="seconds"),
         "adapter": adapter,
         "tool": tool,
-        "cwd": cwd,
+        "cwd": redact_user_paths(cwd),
         "cmd_digest": _digest(raw_input),
         "cmd_chars": len(raw_input),
         "cmd_lines": raw_input.count("\n") + 1 if raw_input else 0,
         "cmd_preview": _preview(raw_input),
-        "matches": matches,
+        "matches": _redact_matches(matches),
         "decision": decision,
     }
     if error_type:
         record["error_type"] = error_type
     if error_detail:
-        record["error_detail"] = error_detail
+        record["error_detail"] = redact_user_paths(error_detail)
     line = json.dumps(record, ensure_ascii=False) + "\n"
 
     target = _today_path(audit_dir, cfg)

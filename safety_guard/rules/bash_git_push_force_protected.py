@@ -15,7 +15,18 @@ def _is_force(words) -> bool:
         if s.startswith("-") and not s.startswith("--") and "f" in s and "r" not in s:
             # 组合短选项 -fu 等。-r 不是 push 的选项，这里粗略
             return True
+        # refspec 强制：+main、+refs/heads/main:refs/heads/main
+        if s.startswith("+") and len(s) > 1:
+            return True
+        if ":" in s and s.split(":", 1)[0].startswith("+"):
+            return True
     return False
+
+
+def _branch_from_refspec(token: str) -> str:
+    """去掉强制前缀 +，再取 refspec 右侧（远端分支）。"""
+    t = token[1:] if token.startswith("+") else token
+    return t.split(":")[-1] if ":" in t else t
 
 
 @register
@@ -50,7 +61,7 @@ class BashGitPushForceProtected(Rule):
                     ),
                 )
             target = tail[-1]
-            branch = target.split(":")[-1] if ":" in target else target
+            branch = _branch_from_refspec(target)
             if is_protected_branch(branch, ctx.config.protected_branches):
                 return RuleMatch(
                     rule_id=self.id,

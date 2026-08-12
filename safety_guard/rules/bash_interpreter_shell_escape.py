@@ -33,6 +33,7 @@ from __future__ import annotations
 import re
 
 from ..context import BashContext
+from ..helpers import normalize_cmd_name
 from .base import Rule, RuleMatch
 from .registry import register
 
@@ -66,6 +67,20 @@ _ESCAPES: dict[str, tuple[str, ...]] = {
     "php": (
         r"\b(?:shell_exec|passthru|proc_open|popen|system|exec)\s*\(",
     ),
+    "lua": (
+        r"\bos\s*\.\s*execute\s*\(",
+        r"\bio\s*\.\s*popen\s*\(",
+    ),
+    "osascript": (
+        r"do\s+shell\s+script",
+        r"\bsystem\s+info\b",  # weak; main is do shell script
+    ),
+    "pwsh": (
+        r"\bInvoke-Expression\b",
+        r"\bIEX\b",
+        r"\bStart-Process\b",
+        r"\bInvoke-Command\b",
+    ),
     "awk": (
         r"\bsystem\s*\(",
         r"\|\s*[\"']?\s*(?:ba|z|da|k)?sh\b",   # "cmd" | "sh"
@@ -85,6 +100,11 @@ _FLAG_INTERPRETERS: dict[str, tuple[str, ...]] = {
     "perl": ("-e", "-E"),
     "ruby": ("-e",),
     "php": ("-r",),
+    "lua": ("-e",),
+    "osascript": ("-e",),
+    "pwsh": ("-c", "-Command", "-command"),
+    "powershell": ("-c", "-Command", "-command"),
+    "powershell.exe": ("-c", "-Command", "-command"),
 }
 
 _POSITIONAL_INTERPRETERS = frozenset({"awk", "gawk", "mawk", "nawk"})
@@ -94,6 +114,8 @@ _FAMILY = {
     "python": "python", "python2": "python", "python3": "python",
     "node": "node", "deno": "node", "bun": "node",
     "perl": "perl", "ruby": "ruby", "php": "php",
+    "lua": "lua", "osascript": "osascript",
+    "pwsh": "pwsh", "powershell": "pwsh", "powershell.exe": "pwsh",
     "awk": "awk", "gawk": "awk", "mawk": "awk", "nawk": "awk",
 }
 
@@ -154,12 +176,13 @@ class BashInterpreterShellEscape(Rule):
             return None
         hits: list[tuple[str, str]] = []
         for cmd in ctx.ast.commands:
-            fam = _FAMILY.get(cmd.name or "")
+            name = normalize_cmd_name(cmd.name or "")
+            fam = _FAMILY.get(name)
             if fam is None:
                 continue
-            if cmd.name in _FLAG_INTERPRETERS:
-                payloads = _flag_payloads(cmd, _FLAG_INTERPRETERS[cmd.name])
-            elif cmd.name in _POSITIONAL_INTERPRETERS:
+            if name in _FLAG_INTERPRETERS:
+                payloads = _flag_payloads(cmd, _FLAG_INTERPRETERS[name])
+            elif name in _POSITIONAL_INTERPRETERS:
                 payloads = _positional_payload(cmd)
             else:
                 continue
@@ -167,7 +190,7 @@ class BashInterpreterShellEscape(Rule):
                 for rx in _COMPILED[fam]:
                     m = rx.search(payload)
                     if m:
-                        hits.append((cmd.name, m.group(0).strip()))
+                        hits.append((name, m.group(0).strip()))
                         break
         if not hits:
             return None

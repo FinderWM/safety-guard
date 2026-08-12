@@ -6,9 +6,102 @@ from pathlib import Path
 from typing import Iterable
 
 
-SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh"})
-NET_FETCHERS = frozenset({"curl", "wget", "fetch", "aria2c"})
+SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh", "fish", "ash"})
+NET_FETCHERS = frozenset({
+    "curl", "wget", "fetch", "aria2c", "nc", "ncat",
+    "http", "https", "httpie", "axel", "lwp-request",
+})
+# 管道终点：把远端字节流当程序跑的解释器（与 shell 同级拦截）
+EXEC_INTERPRETERS = frozenset({
+    "python", "python2", "python3",
+    "node", "deno", "bun",
+    "perl", "ruby", "php", "lua",
+    "osascript", "pwsh", "powershell", "powershell.exe",
+    "Rscript", "julia",
+})
+# busybox/toybox 多调用：`busybox sh` 的 argv[0] 是 busybox，真正 shell 在 argv[1]
+_MULTICALL_BUSYBOX = frozenset({"busybox", "toybox"})
 DESTRUCTIVE_GIT_SUBCOMMANDS = frozenset({"clean", "reset", "branch", "stash", "worktree", "rebase"})
+
+# 可直接执行脚本文件的解释器/壳（路径操作数 outside → outside-script-exec）
+SCRIPT_RUNNERS = frozenset(
+    set(SHELLS)
+    | {
+        "python", "python2", "python3", "node", "deno", "bun",
+        "perl", "ruby", "php", "lua", "osascript", "pwsh", "powershell",
+        "Rscript", "julia", "make",
+    }
+)
+
+
+def normalize_cmd_name(name: str) -> str:
+    """去掉 argv[0] 的目录前缀，供按命令名匹配的规则使用。
+
+    `/bin/bash`、`/usr/bin/curl` 与裸名同义；不剥的话 SHELLS/NET_FETCHERS/
+    read_only_commands 的精确集合全被绕过。只取最后一段，不解析 PATH、不 follow link。
+    """
+    if not name:
+        return name
+    # 防御 `bash\n` 之类异常 token
+    base = name.rstrip("/").rsplit("/", 1)[-1]
+    return base if base else name
+
+
+def redact_user_paths(text: str, home: str | None = None) -> str:
+    """对外展示/审计前去掉真实家目录，避免 reason/audit 泄漏用户名路径。"""
+    if not text:
+        return text
+    h = home or str(Path.home())
+    if h and h in text:
+        text = text.replace(h, "$HOME")
+    # 常见绝对家目录形态（其它用户机器上的审计回放）
+    if text.startswith("/Users/") or "/Users/" in text:
+        import re
+        text = re.sub(r"/Users/[^/\s\"']+", "$HOME", text)
+    if text.startswith("/home/") or "/home/" in text:
+        import re
+        text = re.sub(r"/home/[^/\s\"']+", "$HOME", text)
+    return text
+
+
+def is_shell_name(name: str) -> bool:
+    return normalize_cmd_name(name) in SHELLS
+
+
+def is_net_fetcher_name(name: str) -> bool:
+    return normalize_cmd_name(name) in NET_FETCHERS
+
+
+def is_exec_interpreter_name(name: str) -> bool:
+    return normalize_cmd_name(name) in EXEC_INTERPRETERS
+
+
+def is_pipeline_exec_sink(cmd) -> bool:
+    """管道终点是否会执行上游字节流（shell / busybox sh / 解释器）。"""
+    raw_name = getattr(cmd, "name", "") or ""
+    name = normalize_cmd_name(raw_name)
+    if name in SHELLS or name in EXEC_INTERPRETERS:
+        return True
+    if name in _MULTICALL_BUSYBOX:
+        args = getattr(cmd, "args", None) or getattr(cmd, "words", [])[1:]
+        if not args:
+            return False
+        first = getattr(args[0], "literal", None) or getattr(args[0], "raw", "") or ""
+        # busybox sh / busybox ash —— ash 也当 shell sink
+        return normalize_cmd_name(first) in SHELLS or normalize_cmd_name(first) == "ash"
+    return False
+
+
+def pipeline_sink_label(cmd) -> str:
+    """理由串里展示的终点名（保留 busybox sh 形态）。"""
+    raw_name = getattr(cmd, "name", "") or ""
+    name = normalize_cmd_name(raw_name)
+    if name in _MULTICALL_BUSYBOX:
+        args = getattr(cmd, "args", None) or []
+        if args:
+            sub = getattr(args[0], "literal", None) or getattr(args[0], "raw", "") or ""
+            return f"{name} {normalize_cmd_name(sub)}"
+    return name or raw_name
 
 # 「选项 + 独立取值」形式的参数：跳过选项和它的值，避免把值当成路径操作数。
 # 漏登记的后果是正则被当路径：`rg -C 8 '/api/foo' src` 里 `8` 被当成 pattern，
@@ -70,14 +163,14 @@ def is_root_like_path(path: str) -> bool:
 def word_display(w) -> str:
     """理由串里展示 word：折叠改变了含义时同时给出原文与折叠结果。
 
-    `$A/config` 单独看不出指向哪，`$A/config → /Users/x/.ssh/config` 才让用户
-    有判断依据——这是变量拼接类拦截可解释性的关键。
+    `$A/config` 单独看不出指向哪，`$A/config → $HOME/…` 才让用户有判断依据。
+    折叠后的绝对家目录会脱敏，避免确认框/审计泄漏真实用户名路径。
     """
     raw = getattr(w, "raw", str(w))
     folded = getattr(w, "folded", None)
     if folded and folded != raw:
-        return f"{raw} → {folded}"
-    return raw
+        return f"{raw} → {redact_user_paths(folded)}"
+    return redact_user_paths(raw)
 
 
 def has_traversal(token: str) -> bool:
@@ -167,6 +260,7 @@ def command_uses_in_place_edit(name: str, args: Iterable) -> bool:
 
 def command_is_read_only(name: str, args: Iterable, read_only_commands: frozenset[str]) -> bool:
     """Return whether a command should be treated as path-read-only."""
+    name = normalize_cmd_name(name)
     if name not in read_only_commands:
         return False
     if name in ("sed", "awk"):
@@ -180,6 +274,7 @@ def iter_path_args(name: str, args: list) -> list:
     Regex/program operands for rg/grep/sed/awk are intentionally skipped so a
     pattern like `/api/foo|/api/bar` is not mistaken for an absolute path.
     """
+    name = normalize_cmd_name(name)
     if name in ("rg", "grep"):
         return _path_args_after_pattern(name, args)
     if name in ("sed", "awk"):
@@ -205,9 +300,11 @@ NAVIGATION_COMMANDS = frozenset({"cd", "pushd", "popd", "dirs"})
 
 # 解释器：路径操作数是「被执行的脚本」，读不是写
 INTERPRETERS = frozenset({
-    "bash", "sh", "zsh", "dash", "ksh", "python", "python3", "python2",
-    "node", "deno", "bun", "ruby", "perl", "php", "osascript", "Rscript",
-    "java", "go", "uv", "uvx", "npx", "pnpx",
+    "bash", "sh", "zsh", "dash", "ksh", "fish", "ash",
+    "python", "python3", "python2",
+    "node", "deno", "bun", "ruby", "perl", "php", "lua",
+    "osascript", "Rscript", "pwsh", "powershell",
+    "java", "go", "uv", "uvx", "npx", "pnpx", "julia",
 })
 
 # 参数是纯数据、从不打开文件的命令。它们的输出去向由重定向分支单独判定，
@@ -313,6 +410,7 @@ def iter_read_sources(name: str, args: list, read_only_commands: frozenset[str])
     """
     if not name:
         return []
+    name = normalize_cmd_name(name)
     # 白名单只读命令走既有通道，避免重复上报
     if command_is_read_only(name, args, read_only_commands):
         return []
@@ -339,6 +437,10 @@ def iter_read_sources(name: str, args: list, read_only_commands: frozenset[str])
                 out.append(a)
         out.extend(_option_values(args, frozenset({"-T", "--upload-file"})))
         return out
+
+    if name == "xargs":
+        # xargs -a FILE / --arg-file=FILE：从文件读参数列表，等同读源
+        return _option_values(args, frozenset({"-a", "--arg-file"}))
 
     if name in _SRC_THEN_DEST_COMMANDS:
         positional = _positional_args(_skip_read_only_options(name, args))
@@ -472,6 +574,7 @@ def iter_write_targets(name: str, args: list, read_only_commands: frozenset[str]
     """返回命令中真正会被写/删/移的路径 words。纯读命令返回空。"""
     if not name:
         return []
+    name = normalize_cmd_name(name)
     if command_is_read_only(name, args, read_only_commands):
         return []
     if name in NAVIGATION_COMMANDS or name in INTERPRETERS:

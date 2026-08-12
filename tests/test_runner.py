@@ -116,3 +116,32 @@ def test_real_entry_reads_stdin_with_explicit_adapter(tmp_path: Path):
     output = json.loads(completed.stdout)
     assert output["hookSpecificOutput"]["hookEventName"] == "PreToolUse"
     assert output["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+def test_wrong_adapter_on_pretool_fails_closed(tmp_path: Path):
+    output = runner.run(
+        {
+            "hook_event_name": "pre_tool_use",
+            "tool_name": "run_terminal_command",
+            "tool_input": {"command": "rm -rf /"},
+            "cwd": str(tmp_path),
+        },
+        adapter=get("claude"),
+        config=_fail_closed_config(),
+    )
+    assert output["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert "未识别此 PreToolUse" in output["hookSpecificOutput"]["permissionDecisionReason"]
+
+
+def test_post_tool_use_still_ignored(tmp_path: Path):
+    output = runner.run(
+        {
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": "rm -rf /"},
+            "cwd": str(tmp_path),
+        },
+        adapter=get("claude"),
+        config=_fail_closed_config(),
+    )
+    assert output == {}
+

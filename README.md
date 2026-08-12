@@ -4,7 +4,7 @@
 
 它不是 OS sandbox，也不替代人工审查。目标是把「误删家目录 / force-push main / 管道执行远端脚本 / 改掉 hook 自身」等高代价失误，在 Hook 层挡下来或强制二次确认。
 
-当前内置 **Claude Code**、**Codex** 与 **Grok** 适配器，**30** 条规则、同一套引擎。
+当前内置 **Claude Code**、**Codex** 与 **Grok** 适配器，**35** 条规则、同一套引擎。
 
 ## 它做什么
 
@@ -18,7 +18,7 @@
 
 - **整盘/整家删除**：`rm -rf /`、`find / -delete`、`find ~ -exec rm`
 - **破坏性 git / 远端**：`git reset --hard`、`git push --force` 到保护分支、`gh pr close`
-- **远程代码执行**：`curl | sh`、`eval "$(curl …)"`、`bash <(…)`
+- **远程代码执行**：`curl | sh`、`curl | /bin/bash`、`curl | python3`、`eval "$(curl …)"`、`bash -s < <(curl…)`、解释器 urlopen+exec
 - **环境颠覆**：`PATH=` / `LD_PRELOAD=` / `BASH_ENV=` 前缀赋值
 - **越界读写**：CWD 外路径；`~/.claude` / `~/.agents` 等指令区写入需确认
 - **整文件覆盖 / 删格**：`Write` 覆盖已有文件、`NotebookEdit delete`、`apply_patch` 删除
@@ -43,7 +43,7 @@
 | `claude`（默认） | Claude Code `PreToolUse` | `Bash` / `Write` / `Edit` / `NotebookEdit` |
 | `codex-pretool` | Codex `PreToolUse` | `Bash`/`shell`、`apply_patch` |
 | `codex-permission` | Codex `PermissionRequest` | 同上 |
-| `grok` | Grok `pre_tool_use` / `PreToolUse` | `run_terminal_command`、`search_replace`（及 Bash/Write/Edit 别名） |
+| `grok` | Grok `pre_tool_use` / `PreToolUse` | `run_terminal_command`、`write`、`search_replace`（及 Bash/Write/Edit 别名） |
 
 选择优先级：`--adapter` 参数 → 环境变量 `SAFETY_GUARD_ADAPTER` → 默认 `claude`。
 

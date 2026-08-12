@@ -15,8 +15,8 @@
 #   SAFETY_GUARD_NO_AUDIT=1  不写审计（pytest / --regression / 手工回放专用）
 #   SAFETY_GUARD_IGNORE_DISABLED_RULES=1  忽略下面的 disabled_rules（测试用）
 # 临时禁用某条规则（不需要时留空数组）
-disabled_rules = ["file-critical-path-write"]
-#disabled_rules = []
+# 改 safety_guard 包内文件时可临时加入 file-critical-path-write；改完务必清空。
+disabled_rules = []
 
 # git push --force 拦截的保护分支
 protected_branches = ["main", "master", "release/*"]
@@ -26,7 +26,7 @@ protected_branches = ["main", "master", "release/*"]
 # `find ~/.m2/repository`、`ls ~/.m2/...` 是残留误报的主要来源；放进来后
 # 读放行、写（rm / cp 进去）仍然 ask。
 read_only_zones = [
-  "~/.claude", "~/.agents", "~/.codex",
+  "~/.claude", "~/.agents", "~/.codex", "~/.grok",
   "~/.m2/repository", "~/.gradle/caches",
 ]
 
@@ -38,7 +38,9 @@ read_only_commands = [
   "nl", "tree", "diff", "jq", "yq", "du", "df", "realpath", "readlink",
   "basename", "dirname", "which", "type", "column", "sort", "uniq", "cut",
   "less", "more", "od", "xxd", "hexdump", "strings",
+  "base64", "base32", "certutil",
   "md5", "md5sum", "shasum", "sha1sum", "sha256sum", "cksum",
+  "bat", "batcat",
 ]
 
 # 前缀包装命令：剥掉后按内层真命令分发规则。
@@ -55,6 +57,8 @@ wrapper_commands = [
 critical_paths = [
   "~/.claude/settings.json",
   "~/.codex/config.toml",
+  "~/.grok/config.toml",
+  "~/.grok/hooks",
 ]
 
 # 行为开关

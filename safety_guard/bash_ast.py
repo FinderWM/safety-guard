@@ -11,10 +11,19 @@ from typing import Iterable
 
 import bashlex
 
+from .helpers import normalize_cmd_name
+
 
 class BashParseError(Exception):
     """bashlex 解析失败的封装异常。"""
 
+
+def _cmd_name(word: WordSpec | None = None, *, raw: str | None = None) -> str:
+    """从 word 取规范化 argv[0]（去 /usr/bin/ 前缀）。"""
+    if word is not None:
+        text = word.literal if word.literal is not None else word.raw
+        return normalize_cmd_name(text or "")
+    return normalize_cmd_name(raw or "")
 
 @dataclass
 class WordSpec:
@@ -64,6 +73,8 @@ class CommandSpec:
     redirects: list["RedirectSpec"] = field(default_factory=list)
     wrappers: tuple[str, ...] = ()  # 被剥掉的包装前缀，如 ("rtk",) / ("sudo", "env")
     assignments: list[AssignSpec] = field(default_factory=list)
+    # wrapper 剥层时继承的读源（如 xargs -a FILE → 内层 cat 仍需看见 FILE）
+    extra_reads: list[WordSpec] = field(default_factory=list)
 
     @property
     def args(self) -> list[WordSpec]:
@@ -172,9 +183,20 @@ _WRAPPER_SKIP_SUBCOMMAND: dict[str, frozenset[str]] = {
 _MAX_UNWRAP_DEPTH = 4
 
 
+def _words_from_shell_string(text: str) -> list[WordSpec] | None:
+    """把 env -S 的字面载荷拆成 WordSpec 列表；失败返回 None。"""
+    try:
+        tokens = shlex.split(text, posix=True)
+    except ValueError:
+        return None
+    if not tokens:
+        return None
+    return [_token_word(t) for t in tokens]
+
+
 def _unwrap_once(cmd: CommandSpec, wrappers: frozenset[str]) -> CommandSpec | None:
     """剥掉一层包装前缀；不是包装命令或剥完没内容则返回 None。"""
-    name = cmd.name
+    name = normalize_cmd_name(cmd.name)
     if name not in wrappers or len(cmd.words) < 2:
         return None
 
@@ -183,14 +205,65 @@ def _unwrap_once(cmd: CommandSpec, wrappers: frozenset[str]) -> CommandSpec | No
     subcommands = _WRAPPER_SKIP_SUBCOMMAND.get(name, frozenset())
 
     carried: list[AssignSpec] = []
+    inherited_reads: list[WordSpec] = list(getattr(cmd, "extra_reads", None) or [])
     i = 1
     while i < len(cmd.words):
         raw = cmd.words[i].raw
+        # env -S 'bash -c …'：-S 的值是再拆词后的完整命令行，不展开则内层全隐身
+        if name == "env" and raw in ("-S", "--split-string") and i + 1 < len(cmd.words):
+            payload = cmd.words[i + 1]
+            lit = payload.literal
+            if lit is None:
+                return None  # 动态 -S 载荷：留给 opaque 收集
+            split_words = _words_from_shell_string(lit)
+            if not split_words:
+                return None
+            trailing = list(cmd.words[i + 2:])
+            inner = split_words + trailing
+            return CommandSpec(
+                name=_cmd_name(inner[0]),
+                words=inner,
+                raw=cmd.raw,
+                redirects=cmd.redirects,
+                wrappers=cmd.wrappers + (name,),
+                assignments=cmd.assignments + carried,
+                extra_reads=inherited_reads,
+            )
+        if raw.startswith("--split-string=") and name == "env":
+            lit = raw.split("=", 1)[1]
+            split_words = _words_from_shell_string(lit)
+            if not split_words:
+                return None
+            trailing = list(cmd.words[i + 1:])
+            inner = split_words + trailing
+            return CommandSpec(
+                name=_cmd_name(inner[0]),
+                words=inner,
+                raw=cmd.raw,
+                redirects=cmd.redirects,
+                wrappers=cmd.wrappers + (name,),
+                assignments=cmd.assignments + carried,
+                extra_reads=inherited_reads,
+            )
+        # xargs -a FILE：剥层后内层命令必须继承 FILE 为读源
+        if name == "xargs" and raw in ("-a", "--arg-file") and i + 1 < len(cmd.words):
+            inherited_reads.append(cmd.words[i + 1])
+            i += 2
+            continue
+        if name == "xargs" and raw.startswith("--arg-file="):
+            # 合成一个 word 指向 = 右侧
+            val = raw.split("=", 1)[1]
+            inherited_reads.append(_token_word(val))
+            i += 1
+            continue
         if raw in value_opts:
             i += 2
             continue
         if raw.startswith("-") and raw != "-":
             # 长/短选项、bundled 短选项（-n1、-I{}）都按无值处理
+            # 注意：env 的 -S 已在上面处理，不会落到「跳过选项丢掉值」
+            if name == "env" and raw in ("-S", "--split-string"):
+                return None
             i += 1
             continue
         # 任何 wrapper 在选项之后、真命令之前都可能夹着 NAME=VALUE。
@@ -222,12 +295,42 @@ def _unwrap_once(cmd: CommandSpec, wrappers: frozenset[str]) -> CommandSpec | No
 
     inner = cmd.words[i:]
     return CommandSpec(
-        name=inner[0].literal or inner[0].raw,
+        name=_cmd_name(inner[0]),
         words=inner,
         raw=cmd.raw,
         redirects=cmd.redirects,
         wrappers=cmd.wrappers + (name,),
         assignments=cmd.assignments + carried,
+        extra_reads=inherited_reads,
+    )
+
+
+def _peel_multicall(cmd: CommandSpec) -> CommandSpec:
+    """busybox/toybox 多调用：`busybox cat f` → 内层 cat，规则按真 applet 匹配。"""
+    name = normalize_cmd_name(cmd.name)
+    if name not in ("busybox", "toybox") or len(cmd.words) < 2:
+        return cmd
+    i = 1
+    while i < len(cmd.words):
+        raw = cmd.words[i].raw
+        if raw == "--":
+            i += 1
+            continue
+        if raw.startswith("-") and raw != "-":
+            i += 1
+            continue
+        break
+    if i >= len(cmd.words):
+        return cmd
+    inner = cmd.words[i:]
+    return CommandSpec(
+        name=_cmd_name(inner[0]),
+        words=inner,
+        raw=cmd.raw,
+        redirects=cmd.redirects,
+        wrappers=cmd.wrappers + (name,),
+        assignments=cmd.assignments,
+        extra_reads=list(getattr(cmd, "extra_reads", None) or []),
     )
 
 
@@ -237,13 +340,13 @@ def unwrap_command(cmd: CommandSpec, wrappers: frozenset[str]) -> CommandSpec:
     for _ in range(_MAX_UNWRAP_DEPTH):
         nxt = _unwrap_once(current, wrappers)
         if nxt is None:
-            return current
+            break
         current = nxt
-    return current
+    return _peel_multicall(current)
 
 
 # `bash -c '<inner>'` 的载荷需要再解析一层，否则内层危险命令完全不可见
-_INLINE_SCRIPT_SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh"})
+_INLINE_SCRIPT_SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh", "fish", "ash"})
 
 # 解释器的内联代码选项。载荷不是 shell 语法，无法再解析成 CommandSpec，但
 # 「运行时才成形」这一威胁与 sh -c 完全同构：`python3 -c "$(gen)"` 同样让
@@ -253,8 +356,13 @@ _INLINE_CODE_INTERPRETERS: dict[str, frozenset[str]] = {
     "python2": frozenset({"-c"}),
     "python3": frozenset({"-c"}),
     "node": frozenset({"-e", "--eval", "-p", "--print"}),
-    "deno": frozenset({"eval"}),
+    "deno": frozenset({"eval", "run"}),
     "bun": frozenset({"-e", "--eval"}),
+    "pwsh": frozenset({"-c", "-Command", "-command"}),
+    "powershell": frozenset({"-c", "-Command", "-command"}),
+    "powershell.exe": frozenset({"-c", "-Command", "-command"}),
+    "osascript": frozenset({"-e"}),
+    "lua": frozenset({"-e"}),
     "perl": frozenset({"-e", "-E"}),
     "ruby": frozenset({"-e"}),
     "php": frozenset({"-r"}),
@@ -267,21 +375,46 @@ _INLINE_CODE_INTERPRETERS: dict[str, frozenset[str]] = {
 _EVAL_BUILTINS = frozenset({"eval"})
 
 
-def _is_inline_command_flag(raw: str) -> bool:
+def _is_c_flag_literal(raw: str) -> bool:
+    """字面 `-…c…` 短选项是否吃脚本载荷（排除长选项）。"""
+    if not raw.startswith("-") or raw.startswith("--") or raw == "-":
+        return False
+    # 带值的单字母选项（-O shopt / -o option）后面跟的是选项值，不是载荷；
+    # 若它们出现在捆绑串里，`c` 之后的字母会被当成那个值，此处保守只看是否含 c。
+    return "c" in raw[1:]
+
+
+def is_inline_command_flag(raw: str, source: str | None = None) -> bool:
     """判断一个 word 是不是「下一个参数是脚本载荷」的 -c 形态。
 
     bash 的单字母选项可任意捆绑与排序：`-cx` / `-xc` / `-cv` / `-ce` 都是合法的
-    `-c`，实测全部会执行载荷。只认 `-c`/`-lc`/`-ic` 三个字面量的话，改一个字母
-    就能让整条内层命令重新隐身——和只认 `-f` 却漏掉 `-rf` 是同一类错误。
+    `-c`。还要覆盖 ANSI-C 混淆：`bash $'-c' 'rm -rf /'`。
 
-    排除 `--` 开头的长选项：`--norc` 含 c 但不吃载荷。
+    bashlex 会把 `$'-c'` 误解析成 word=`$-c`（parameter），candidates(raw) 展不开；
+    必须同时看 source 原文切片（仍是 `$'-c'`）再做 ANSI-C 展开。
     """
-    if not raw.startswith("-") or raw.startswith("--") or raw == "-":
-        return False
-    flags = raw[1:]
-    # 带值的单字母选项（-O shopt / -o option）后面跟的是选项值，不是载荷；
-    # 若它们出现在捆绑串里，`c` 之后的字母会被当成那个值，此处保守只看是否含 c。
-    return "c" in flags
+    from . import expand as _expand_mod
+
+    for token in (raw, source or ""):
+        if not token:
+            continue
+        if _is_c_flag_literal(token):
+            return True
+        try:
+            cands = _expand_mod.candidates(token)
+        except Exception:
+            continue
+        if any(_is_c_flag_literal(c) for c in cands):
+            return True
+    return False
+
+
+def word_is_inline_command_flag(w: WordSpec) -> bool:
+    return is_inline_command_flag(w.raw, getattr(w, "source", None))
+
+
+# 旧名别名：规则与测试可能仍引用
+_is_inline_command_flag = is_inline_command_flag
 
 
 def _is_placeholder_literal(text: str) -> bool:
@@ -299,7 +432,8 @@ def _inline_script_payloads(cmd: CommandSpec) -> tuple[list[str], list["OpaquePa
     字面量 `{}` 同样不透明：xargs -I{} 运行时才填，再 parse 只会发明假命令名。
     """
     words = cmd.words
-    if cmd.name in _EVAL_BUILTINS:
+    name = normalize_cmd_name(cmd.name)
+    if name in _EVAL_BUILTINS:
         # eval 没有选项，全部参数都是载荷（shell 先拼接再执行）。
         # 字面量交给下游再 parse 一层，不透明的标记出来。
         ev_literals: list[str] = []
@@ -318,40 +452,40 @@ def _inline_script_payloads(cmd: CommandSpec) -> tuple[list[str], list["OpaquePa
                     OpaquePayload(shell="eval", raw=w.raw, command_raw=cmd.raw)
                 )
         return ev_literals, ev_opaque
-    if cmd.name in _INLINE_CODE_INTERPRETERS:
+    if name in _INLINE_CODE_INTERPRETERS:
         # 解释器载荷不是 shell 语法，不能再 parse；只在不透明时报告
-        flags = _INLINE_CODE_INTERPRETERS[cmd.name]
+        flags = _INLINE_CODE_INTERPRETERS[name]
         opaque: list[OpaquePayload] = []
         for i, w in enumerate(words[1:], start=1):
             if w.raw in flags and i + 1 < len(words):
                 payload = words[i + 1]
                 if payload.literal is None:
                     opaque.append(
-                        OpaquePayload(shell=cmd.name, raw=payload.raw, command_raw=cmd.raw)
+                        OpaquePayload(shell=name, raw=payload.raw, command_raw=cmd.raw)
                     )
                 elif _is_placeholder_literal(payload.literal):
                     opaque.append(
                         OpaquePayload(
-                            shell=cmd.name,
+                            shell=name,
                             raw=payload.raw,
                             command_raw=cmd.raw,
                             kind="placeholder",
                         )
                     )
         return [], opaque
-    if cmd.name not in _INLINE_SCRIPT_SHELLS:
+    if name not in _INLINE_SCRIPT_SHELLS:
         return [], []
     literals: list[str] = []
     opaque: list[OpaquePayload] = []
     for i, w in enumerate(words[1:], start=1):
-        if _is_inline_command_flag(w.raw) and i + 1 < len(words):
+        if word_is_inline_command_flag(w) and i + 1 < len(words):
             payload = words[i + 1]
             if payload.literal is not None and not _is_placeholder_literal(payload.literal):
                 literals.append(payload.literal)
             elif payload.literal is not None and _is_placeholder_literal(payload.literal):
                 opaque.append(
                     OpaquePayload(
-                        shell=cmd.name,
+                        shell=name,
                         raw=payload.raw,
                         command_raw=cmd.raw,
                         kind="placeholder",
@@ -359,7 +493,7 @@ def _inline_script_payloads(cmd: CommandSpec) -> tuple[list[str], list["OpaquePa
                 )
             else:
                 opaque.append(
-                    OpaquePayload(shell=cmd.name, raw=payload.raw, command_raw=cmd.raw)
+                    OpaquePayload(shell=name, raw=payload.raw, command_raw=cmd.raw)
                 )
     return literals, opaque
 
@@ -373,7 +507,7 @@ _PROCESS_SUBST_SCRIPT_HOSTS = frozenset(
 )
 
 
-def _is_process_subst_script_word(w: WordSpec) -> bool:
+def is_process_subst_script_word(w: WordSpec) -> bool:
     """word 是否为 `<(…)` 进程替换（脚本源形态；`>(…)` 是写出，不在此列）。"""
     raw = w.raw.lstrip()
     if not raw.startswith("<("):
@@ -384,13 +518,68 @@ def _is_process_subst_script_word(w: WordSpec) -> bool:
     return True
 
 
+_is_process_subst_script_word = is_process_subst_script_word
+
+
+def _shell_has_s_flag(cmd: CommandSpec) -> bool:
+    """是否带 -s（从 stdin 读脚本）；捆绑短选项里含 s 且不是纯长选项。"""
+    for w in cmd.words[1:]:
+        raw = w.raw
+        if raw in ("-s",):
+            return True
+        if raw.startswith("-") and not raw.startswith("--") and raw != "-":
+            if "s" in raw[1:]:
+                return True
+    return False
+
+
+def _redirect_is_script_source(r: RedirectSpec) -> bool:
+    """输入重定向是否把外部内容当脚本喂给 shell（process-subst / 命令替换）。"""
+    if r.op not in ("<", "<<<") or r.target is None:
+        return False
+    t = r.target
+    if is_process_subst_script_word(t):
+        return True
+    # `<<< "$(curl …)"` / `source /dev/stdin <<< "$(…)"`
+    return bool(t.has_expansion)
+
+
+def _collect_env_s_opaque(cmd: CommandSpec) -> list[OpaquePayload]:
+    """env -S 动态载荷：unwrap 拆不开时必须标记，否则内层命令整段隐身。"""
+    if normalize_cmd_name(cmd.name) != "env":
+        return []
+    words = cmd.words
+    for i, w in enumerate(words[1:], start=1):
+        raw = w.raw
+        if raw in ("-S", "--split-string") and i + 1 < len(words):
+            payload = words[i + 1]
+            if payload.literal is None:
+                return [
+                    OpaquePayload(
+                        shell="env",
+                        raw=payload.raw,
+                        command_raw=cmd.raw,
+                        kind="inline-script",
+                    )
+                ]
+        if raw.startswith("--split-string=") and "$" in raw:
+            return [
+                OpaquePayload(
+                    shell="env", raw=raw, command_raw=cmd.raw, kind="inline-script",
+                )
+            ]
+    return []
+
+
 def _collect_structural_opaque(cmd: CommandSpec) -> list[OpaquePayload]:
-    """收集非 inline-script 的不透明执行形态：process-subst / find-exec。
+    """收集非 inline-script 的不透明执行形态：process-subst / stdin-script / find-exec。
 
     placeholder 在 _inline_script_payloads 里处理（与 -c 载荷同路径）。
     """
     found: list[OpaquePayload] = []
-    if cmd.name in _PROCESS_SUBST_SCRIPT_HOSTS:
+    found.extend(_collect_env_s_opaque(cmd))
+    name = normalize_cmd_name(cmd.name)
+    if name in _PROCESS_SUBST_SCRIPT_HOSTS:
         for w in cmd.words[1:]:
             raw = w.raw
             # 跳过选项；下一位置参数才可能是脚本源
@@ -398,10 +587,10 @@ def _collect_structural_opaque(cmd: CommandSpec) -> list[OpaquePayload]:
                 continue
             if raw == "--":
                 continue
-            if _is_process_subst_script_word(w):
+            if is_process_subst_script_word(w):
                 found.append(
                     OpaquePayload(
-                        shell=cmd.name,
+                        shell=name,
                         raw=w.raw,
                         command_raw=cmd.raw,
                         kind="process-subst",
@@ -410,7 +599,36 @@ def _collect_structural_opaque(cmd: CommandSpec) -> list[OpaquePayload]:
                 break
             # 第一个位置参数已见且非 process-subst → 普通脚本路径，结束
             break
-    if cmd.name == "find":
+        # 重定向形态：`bash -s < <(curl …)` / `bash < <(…)` / `source /dev/stdin <<< "$(…)"`
+        # 位置参数路径走不到这里，脚本源挂在 redirect 上。
+        for r in cmd.redirects:
+            if not _redirect_is_script_source(r):
+                continue
+            t = r.target
+            assert t is not None
+            if is_process_subst_script_word(t):
+                kind = "process-subst"
+            elif name in ("source", ".") or _shell_has_s_flag(cmd) or name in _INLINE_SCRIPT_SHELLS:
+                # shell 从 stdin/here-string 读脚本，或 source /dev/stdin
+                if name in ("source", "."):
+                    pos = [w.raw for w in cmd.args if not w.raw.startswith("-")]
+                    if not any(p in ("/dev/stdin", "-", "/dev/fd/0") for p in pos):
+                        # source 普通文件 + <<< 数据：不是脚本源注入
+                        if r.op == "<<<":
+                            continue
+                kind = "stdin-script"
+            else:
+                continue
+            found.append(
+                OpaquePayload(
+                    shell=name,
+                    raw=f"{r.op} {t.raw}",
+                    command_raw=cmd.raw,
+                    kind=kind,
+                )
+            )
+            break
+    if name == "find":
         args = list(cmd.args)
         for i, w in enumerate(args):
             if w.raw not in ("-exec", "-execdir"):
@@ -593,7 +811,7 @@ def _command_from_tokens(tokens: list[str]) -> CommandSpec | None:
             a.origin = "standalone"
         return CommandSpec(name="", words=[], raw=" ".join(tokens), redirects=redirects, assignments=assigns)
     return CommandSpec(
-        name=words[0].literal or words[0].raw,
+        name=_cmd_name(words[0]),
         words=words,
         raw=" ".join(tokens),
         redirects=redirects,
@@ -776,7 +994,7 @@ def _command_spec(raw: str, node) -> CommandSpec:
             a.origin = "standalone"
         return CommandSpec(name="", words=[], raw=_slice(raw, node), redirects=rds, assignments=assigns)
     return CommandSpec(
-        name=words[0].literal or words[0].raw,
+        name=_cmd_name(words[0]),
         words=words,
         raw=_slice(raw, node),
         redirects=rds,

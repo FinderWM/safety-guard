@@ -40,15 +40,17 @@ def _bash_parse_reason(parse_error: str) -> str:
 
 def _decide(matches: list[RuleMatch]) -> tuple[Decision, str | None]:
     """聚合决策：有 high → deny；只有 medium → ask；空 → allow。"""
+    from .helpers import redact_user_paths
+
     if not matches:
         return "allow", None
     severities = {m.severity for m in matches}
     if "high" in severities:
         ordered = sorted(matches, key=lambda m: 0 if m.severity == "high" else 1)
         reason = " | ".join(f"[{m.severity.upper()}:{m.rule_id}] {m.reason}" for m in ordered)
-        return "deny", reason
+        return "deny", redact_user_paths(reason)
     reason = " | ".join(f"[{m.severity.upper()}:{m.rule_id}] {m.reason}" for m in matches)
-    return "ask", reason
+    return "ask", redact_user_paths(reason)
 
 
 def _internal_result(reason: str, cfg: Config) -> DecisionResult:

@@ -12,8 +12,13 @@ _EVENTS = frozenset({"pre_tool_use", "PreToolUse"})
 _CANONICAL_EVENT = "PreToolUse"
 
 # matcher 别名（Bash/Write/Edit）与 Grok 真名都映射到内部 Operation.tool。
-_BASH_TOOLS = frozenset({"run_terminal_command", "Bash", "bash", "shell"})
-_FILE_TOOLS = frozenset({"search_replace", "Write", "Edit", "MultiEdit"})
+# 含小写 write：Grok TUI 原生工具名是 write，不是 Write。
+_BASH_TOOLS = frozenset({
+    "run_terminal_command", "Bash", "bash", "shell", "Shell",
+})
+_FILE_TOOLS = frozenset({
+    "search_replace", "Write", "write", "Edit", "edit", "MultiEdit",
+})
 _SUPPORTED_TOOLS = _BASH_TOOLS | _FILE_TOOLS
 
 
@@ -63,16 +68,18 @@ def _bash_operation(raw_input: dict[str, Any]) -> tuple[Operation, str]:
 
 def _file_operation(raw_tool: str, raw_input: dict[str, Any]) -> tuple[Operation, str]:
     path = _file_path(raw_input)
-    # search_replace：空 old_string 表示新建/整文件写入 → Write；否则定点替换 → Edit。
-    if raw_tool in {"search_replace", "MultiEdit"}:
+    # write / 空 old_string 的 search_replace → 整文件 Write；其余定点 Edit。
+    if raw_tool in {"write", "Write"}:
+        internal = "Write"
+    elif raw_tool in {"search_replace", "MultiEdit"}:
         old = raw_input.get("old_string", "")
         if old is None:
             old = ""
         if not isinstance(old, str):
             raise ValueError("old_string must be a string")
         internal = "Write" if old == "" else "Edit"
-    elif raw_tool == "Write":
-        internal = "Write"
+    elif raw_tool == "Edit" or raw_tool == "edit":
+        internal = "Edit"
     else:
         internal = "Edit"
     return Operation(internal, {"file_path": path}), path

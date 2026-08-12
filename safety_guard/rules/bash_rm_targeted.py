@@ -32,4 +32,15 @@ class BashRmTargeted(Rule):
                     reason=f"`{ctx.raw_command}` 将删除：{', '.join(non_root)}",
                     extra={"targets": non_root},
                 )
+            # 无显式路径：常见于 `ls | xargs rm -rf`，目标由管道注入
+            if not targets:
+                return RuleMatch(
+                    rule_id=self.id,
+                    severity=self.severity,
+                    reason=(
+                        f"`{ctx.raw_command}` 中 rm 未给出显式路径，"
+                        "删除目标可能来自管道/xargs，需确认。"
+                    ),
+                    extra={"targets": []},
+                )
         return None

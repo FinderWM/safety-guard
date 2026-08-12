@@ -53,11 +53,12 @@ def test_pretool_high_risk_denies(cwd: Path):
     assert "bash-git-push-force-protected" in out["hookSpecificOutput"]["permissionDecisionReason"]
 
 
-def test_pretool_medium_risk_returns_system_message(cwd: Path):
+def test_pretool_medium_risk_is_denied(cwd: Path):
     out = _run(_pretool("rm -rf /tmp/foo", cwd), "codex-pretool")
-    assert "systemMessage" in out
-    assert "bash-rm-targeted" in out["systemMessage"]
-    assert "hookSpecificOutput" not in out
+    hs = out["hookSpecificOutput"]
+    assert hs["hookEventName"] == "PreToolUse"
+    assert hs["permissionDecision"] == "deny"
+    assert "bash-rm-targeted" in hs["permissionDecisionReason"]
 
 
 def test_permission_high_risk_denies(cwd: Path):
@@ -68,11 +69,12 @@ def test_permission_high_risk_denies(cwd: Path):
     assert "bash-disable-safety-hook" in decision["message"]
 
 
-def test_permission_medium_risk_falls_back_to_native_prompt(cwd: Path):
+def test_permission_medium_risk_is_denied(cwd: Path):
     out = _run(_permission("rm -rf /tmp/foo", cwd), "codex-permission")
-    assert "systemMessage" in out
-    assert "bash-rm-targeted" in out["systemMessage"]
-    assert "hookSpecificOutput" not in out
+    hs = out["hookSpecificOutput"]
+    assert hs["hookEventName"] == "PermissionRequest"
+    assert hs["decision"]["behavior"] == "deny"
+    assert "bash-rm-targeted" in hs["decision"]["message"]
 
 
 def test_permission_apply_patch_denies_on_critical_target(cwd: Path):
@@ -109,7 +111,7 @@ def test_permission_apply_patch_denies_if_any_operation_is_high_risk(cwd: Path):
     assert "file-critical-path-write" in decision["message"]
 
 
-def test_permission_apply_patch_delete_is_ask(cwd: Path):
+def test_permission_apply_patch_delete_is_denied(cwd: Path):
     target = cwd / "legacy.txt"
     target.write_text("legacy")
     patch = f"""*** Begin Patch
@@ -117,9 +119,9 @@ def test_permission_apply_patch_delete_is_ask(cwd: Path):
 *** End Patch
 """
     out = _run(_permission(patch, cwd, tool_name="apply_patch"), "codex-permission")
-    assert "systemMessage" in out
-    assert "file-patch-delete" in out["systemMessage"]
-    assert "hookSpecificOutput" not in out
+    hs = out["hookSpecificOutput"]
+    assert hs["decision"]["behavior"] == "deny"
+    assert "file-patch-delete" in hs["decision"]["message"]
 
 
 def test_pretool_bash_parse_error_is_audited(cwd: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

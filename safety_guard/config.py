@@ -54,7 +54,7 @@ def _defaults() -> dict:
         "disabled_rules": [],
         "severity_overrides": {},
         "protected_branches": ["main", "master", "release/*"],
-        "read_only_zones": ["~/.claude", "~/.agents", "~/.codex"],
+        "read_only_zones": ["~/.claude", "~/.agents", "~/.codex", "~/.grok"],
         "read_only_commands": [
             "cat", "rg", "grep", "find", "ls", "head", "tail", "wc", "stat", "file",
             "sed", "awk",
@@ -62,7 +62,9 @@ def _defaults() -> dict:
             "nl", "tree", "diff", "jq", "yq", "du", "df", "realpath", "readlink",
             "basename", "dirname", "which", "type", "column", "sort", "uniq", "cut",
             "less", "more", "od", "xxd", "hexdump", "strings",
+            "base64", "base32", "certutil",
             "md5", "md5sum", "shasum", "sha1sum", "sha256sum", "cksum",
+            "bat", "batcat",
         ],
         # 前缀包装命令：剥掉后按内层真命令分发规则。
         # 不剥的话 `rtk rm -rf /` / `sudo rm -rf /` 会绕过全部按命令名匹配的规则。
@@ -72,6 +74,9 @@ def _defaults() -> dict:
         "critical_paths": [
             str(_entry_script()),
             str(_package_dir()),
+            # Grok CLI 配置与 hook 定义：被改掉等于卸防护
+            str(Path.home() / ".grok" / "config.toml"),
+            str(Path.home() / ".grok" / "hooks"),
         ],
         "fail_open": False,
         "dry_run": False,
@@ -117,7 +122,7 @@ def _minimal_config() -> Config:
         disabled_rules=(),
         severity_overrides={},
         protected_branches=("main", "master", "release/*"),
-        read_only_zones=(Path.home() / ".claude", Path.home() / ".agents", Path.home() / ".codex"),
+        read_only_zones=(Path.home() / ".claude", Path.home() / ".agents", Path.home() / ".codex", Path.home() / ".grok"),
         read_only_commands=frozenset({"cat", "rg", "grep", "find", "ls", "head", "tail", "wc", "stat", "file", "sed", "awk"}),
         critical_paths=(root / "safety-guard.py", root / "safety_guard"),
         fail_open=False,

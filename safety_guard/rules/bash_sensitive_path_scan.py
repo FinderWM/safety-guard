@@ -45,6 +45,42 @@ _PATTERNS = {
 # 项目内的 .env 由 in-cwd 判定放行，跨 CWD 访问自有路径规则兜底。
 
 
+def _scan_text(text: str) -> list[str]:
+    return [name for name, rx in _PATTERNS.items() if rx.search(text)]
+
+
+def _expanded_texts(ctx: BashContext) -> list[str]:
+    """raw + 路径槽 expand/fold 候选。brace/ANSI-C 拆开后才能命中凭据模式。"""
+    texts = [ctx.raw_command or ""]
+    ast = ctx.ast
+    if ast is None:
+        return texts
+    from .. import expand as expand_mod
+
+    for cmd in ast.commands:
+        for w in cmd.words:
+            pt = getattr(w, "path_text", None) or getattr(w, "raw", "") or ""
+            if not pt:
+                continue
+            texts.append(pt)
+            try:
+                texts.extend(expand_mod.candidates(pt) or [])
+            except Exception:
+                pass
+        for r in cmd.redirects:
+            t = getattr(r, "target", None)
+            if t is None:
+                continue
+            pt = getattr(t, "path_text", None) or getattr(t, "raw", "") or ""
+            if pt:
+                texts.append(pt)
+                try:
+                    texts.extend(expand_mod.candidates(pt) or [])
+                except Exception:
+                    pass
+    return texts
+
+
 @register
 class BashSensitivePathScan(Rule):
     id = "bash-sensitive-path-scan"
@@ -53,18 +89,23 @@ class BashSensitivePathScan(Rule):
     description = "命令全文出现敏感密钥路径/密钥体字面量需用户确认"
 
     def match(self, ctx: BashContext) -> RuleMatch | None:
-        raw = ctx.raw_command or ""
-        if not raw:
-            return None
-        hits = [name for name, rx in _PATTERNS.items() if rx.search(raw)]
-        if not hits:
+        hit_set: list[str] = []
+        seen: set[str] = set()
+        for text in _expanded_texts(ctx):
+            if not text:
+                continue
+            for name in _scan_text(text):
+                if name not in seen:
+                    seen.add(name)
+                    hit_set.append(name)
+        if not hit_set:
             return None
         return RuleMatch(
             rule_id=self.id,
             severity=self.severity,
             reason=(
-                f"命令全文出现敏感密钥路径/密钥体字面量：{', '.join(hits)}。"
+                f"命令全文出现敏感密钥路径/密钥体字面量：{', '.join(hit_set)}。"
                 "可能读取、复制或外传 ~/.ssh、云凭证等机密文件。"
             ),
-            extra={"patterns": hits},
+            extra={"patterns": hit_set},
         )

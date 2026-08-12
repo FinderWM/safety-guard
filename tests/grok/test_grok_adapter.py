@@ -140,3 +140,37 @@ def test_malformed_tool_input_fails_closed(cwd: Path):
     )
     assert out["decision"] == "deny"
     assert "tool_input must be an object" in out["reason"]
+
+def test_native_write_lowercase_create_allow(grok, cwd: Path):
+    target = cwd / "from-write.txt"
+    out = grok("write", {"file_path": str(target), "content": "hi"}, cwd)
+    assert out == {"decision": "allow"}
+
+
+def test_native_write_lowercase_overwrite_denied(grok, cwd: Path):
+    target = cwd / "exists.txt"
+    target.write_text("old")
+    out = grok("write", {"file_path": str(target), "content": "new"}, cwd)
+    assert out["decision"] == "deny"
+    assert "file-overwrite-existing" in out["reason"]
+
+
+def test_edit_dot_grok_config_denied(grok, cwd: Path):
+    from pathlib import Path as P
+    out = grok(
+        "search_replace",
+        {
+            "file_path": str(P.home() / ".grok" / "config.toml"),
+            "old_string": "a",
+            "new_string": "b",
+        },
+        cwd,
+    )
+    assert out["decision"] == "deny"
+    assert "file-critical-path-write" in out["reason"] or "file-outside-cwd" in out["reason"]
+
+
+def test_read_dot_grok_zone_allowed(grok, cwd: Path):
+    out = grok("run_terminal_command", {"command": "ls ~/.grok"}, cwd)
+    assert out == {"decision": "allow"}
+

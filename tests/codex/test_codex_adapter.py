@@ -15,18 +15,20 @@ def test_pretool_high_is_denied(pretool, cwd: Path):
     assert "bash-git-push-force-protected" in out["hookSpecificOutput"]["permissionDecisionReason"]
 
 
-def test_pretool_medium_returns_system_message(pretool, cwd: Path):
+def test_pretool_medium_is_denied(pretool, cwd: Path):
     out = pretool("Bash", {"command": "rm -rf ./tmp-dir"}, cwd)
-    assert "systemMessage" in out
-    assert "bash-rm-targeted" in out["systemMessage"]
-    assert "hookSpecificOutput" not in out
+    hs = out["hookSpecificOutput"]
+    assert hs["hookEventName"] == "PreToolUse"
+    assert hs["permissionDecision"] == "deny"
+    assert "bash-rm-targeted" in hs["permissionDecisionReason"]
 
 
-def test_permission_medium_returns_system_message(permission, cwd: Path):
+def test_permission_medium_is_denied(permission, cwd: Path):
     out = permission("Bash", {"command": "rm -rf ./tmp-dir"}, cwd)
-    assert "hookSpecificOutput" not in out
-    assert "systemMessage" in out
-    assert "bash-rm-targeted" in out["systemMessage"]
+    hs = out["hookSpecificOutput"]
+    assert hs["hookEventName"] == "PermissionRequest"
+    assert hs["decision"]["behavior"] == "deny"
+    assert "bash-rm-targeted" in hs["decision"]["message"]
 
 
 def test_permission_high_is_denied(permission, cwd: Path):
@@ -51,13 +53,14 @@ def test_apply_patch_critical_path_denied(permission, cwd: Path):
     assert "file-critical-path-write" in hs["decision"]["message"]
 
 
-def test_apply_patch_delete_is_ask(permission, cwd: Path):
+def test_apply_patch_delete_is_denied(permission, cwd: Path):
     victim = cwd / "old.txt"
     victim.write_text("x")
     cmd = _patch("*** Delete File: old.txt")
     out = permission("apply_patch", {"command": cmd}, cwd)
-    assert "systemMessage" in out
-    assert "file-patch-delete" in out["systemMessage"]
+    hs = out["hookSpecificOutput"]
+    assert hs["decision"]["behavior"] == "deny"
+    assert "file-patch-delete" in hs["decision"]["message"]
 
 
 def test_apply_patch_any_high_wins(permission, cwd: Path):
