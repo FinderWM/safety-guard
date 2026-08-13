@@ -1,12 +1,12 @@
 """Codex PreToolUse 与 PermissionRequest 适配器。"""
 from __future__ import annotations
 
-import os
 import re
 from dataclasses import dataclass
 from typing import Any, Literal
 
 from ..contracts import DecisionResult, NormalizedRequest, Operation
+from . import fields
 
 
 _PRETOOL_EVENT = "PreToolUse"
@@ -106,21 +106,17 @@ class CodexAdapter:
     event: Literal["PreToolUse", "PermissionRequest"]
 
     def parse(self, stdin_json: dict[str, Any]) -> NormalizedRequest | None:
-        event = stdin_json.get("hook_event_name") or stdin_json.get("hookEventName")
+        event = fields.event_name(stdin_json)
         if event != self.event:
             return None
 
-        raw_tool = stdin_json.get("tool_name") or stdin_json.get("toolName")
+        raw_tool = fields.tool_name(stdin_json)
         tool = _TOOL_MAP.get(raw_tool)
         if tool is None:
             raise ValueError(f"unsupported Codex tool: {raw_tool!r}")
 
-        raw_input = stdin_json.get("tool_input") or stdin_json.get("toolInput") or {}
-        if not isinstance(raw_input, dict):
-            raise ValueError("tool_input must be an object")
-        cwd = stdin_json.get("cwd") or os.getcwd()
-        if not isinstance(cwd, str):
-            raise ValueError("cwd must be a string")
+        raw_input = fields.tool_input(stdin_json)
+        cwd = fields.cwd(stdin_json)
 
         if tool == "Bash":
             command = raw_input.get("command") or raw_input.get("cmd") or ""

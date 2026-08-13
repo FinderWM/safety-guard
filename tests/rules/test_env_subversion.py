@@ -75,6 +75,9 @@ BENIGN = [
     # 前缀赋值但变量无害
     "NODE_ENV=production npm run build",
     "TZ=UTC date",
+    'PATH="$PATH" git status',
+    'PATH="./bin:$PATH" true',
+    'export PATH="/usr/local/bin:$PATH"',
 ]
 
 

@@ -15,10 +15,12 @@ from __future__ import annotations
 from ..context import BashContext
 from ..helpers import (
     command_is_read_only,
+    is_virtual_device_path,
     iter_path_args,
     iter_read_redirect_targets,
     iter_read_sources,
     looks_like_potentially_outside_path,
+    strip_file_uri,
     strip_path_prefix,
     word_display,
 )
@@ -41,9 +43,14 @@ class BashOutsideCwdRead(Rule):
         seen: set[str] = set()
 
         def consider(w) -> None:
-            text = strip_path_prefix(w.path_text)
+            text = strip_file_uri(strip_path_prefix(w.path_text))
             if not looks_like_potentially_outside_path(text):
                 return
+            try:
+                if is_virtual_device_path(ctx.resolve(text)):
+                    return
+            except Exception:
+                pass
             if ctx.classify(text) != "outside":
                 return
             shown = word_display(w)

@@ -76,6 +76,13 @@ def _detect(args: list[str]) -> str | None:
         return "worktree remove 将删除 worktree 目录与对应分支元数据"
     if sub == "rebase":
         return "rebase 操作可能丢弃或重写提交历史"
+    if sub == "restore":
+        # --staged 只取消暂存，工作区还在；带 --worktree 或默认工作区则丢改动
+        if "--staged" in rest and "--worktree" not in rest:
+            return None
+        return "restore 将丢弃工作区改动"
+    if sub == "checkout" and "--" in rest:
+        return "checkout -- 将丢弃指定路径的工作区改动"
     return None
 
 
@@ -84,7 +91,7 @@ class BashGitDestructive(Rule):
     id = "bash-git-destructive"
     severity = "medium"
     applies_to = ("Bash",)
-    description = "git 的破坏性子命令（reset --hard / clean -f / branch -D / stash drop / worktree remove / rebase）"
+    description = "git 的破坏性子命令（reset --hard / clean -f / branch -D / stash drop / worktree remove / rebase / restore / checkout --）"
 
     def match(self, ctx: BashContext) -> RuleMatch | None:
         if ctx.ast is None:

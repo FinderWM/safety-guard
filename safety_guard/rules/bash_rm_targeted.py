@@ -10,18 +10,23 @@ from .base import Rule, RuleMatch
 from .registry import register
 
 
+_DELETE_COMMANDS = frozenset({
+    "rm", "unlink", "shred", "trash", "trash-put",
+})
+
+
 @register
 class BashRmTargeted(Rule):
     id = "bash-rm-targeted"
     severity = "medium"
     applies_to = ("Bash",)
-    description = "rm 删除文件/目录（非根/家）需用户确认"
+    description = "rm/unlink/shred/trash 删除文件/目录（非根/家）需用户确认"
 
     def match(self, ctx: BashContext) -> RuleMatch | None:
         if ctx.ast is None:
             return None
         for cmd in ctx.ast.commands:
-            if cmd.name != "rm":
+            if cmd.name not in _DELETE_COMMANDS:
                 continue
             targets = [w.raw for w in cmd.args if not w.raw.startswith("-")]
             non_root = [t for t in targets if not is_root_like_path(t)]

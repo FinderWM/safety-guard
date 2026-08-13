@@ -7,6 +7,7 @@ from typing import Any
 
 from . import audit, engine
 from .adapters.base import Adapter
+from .adapters import fields
 from .adapters.registry import select
 from .config import Config, load as load_config
 from .contracts import DecisionResult, NormalizedRequest
@@ -21,10 +22,10 @@ _PRETOOL_EVENTS = frozenset({
 
 
 def _looks_like_pretool(stdin_json: dict[str, Any]) -> bool:
-    event = stdin_json.get("hook_event_name") or stdin_json.get("hookEventName")
+    event = fields.event_name(stdin_json)
     if not isinstance(event, str) or event not in _PRETOOL_EVENTS:
         return False
-    tool = stdin_json.get("tool_name") or stdin_json.get("toolName")
+    tool = fields.tool_name(stdin_json)
     return isinstance(tool, str) and bool(tool.strip())
 
 
@@ -41,18 +42,22 @@ def _internal_result(reason: str, cfg: Config) -> DecisionResult:
 
 
 def _tool_name(stdin_json: dict[str, Any]) -> str:
-    t = stdin_json.get("tool_name") or stdin_json.get("toolName") or ""
-    return t if isinstance(t, str) else ""
+    return fields.tool_name(stdin_json) or ""
 
 
 def _cwd(stdin_json: dict[str, Any]) -> str:
-    c = stdin_json.get("cwd")
-    return c if isinstance(c, str) else ""
+    try:
+        return fields.cwd(stdin_json)
+    except ValueError:
+        return ""
 
 
 def _audit_raw(stdin_json: dict[str, Any]) -> str:
     """无 NormalizedRequest 时尽量留下可回放线索。"""
-    ti = stdin_json.get("tool_input") or stdin_json.get("toolInput") or {}
+    try:
+        ti = fields.tool_input(stdin_json)
+    except ValueError:
+        ti = {}
     if isinstance(ti, dict):
         cmd = ti.get("command") or ti.get("cmd")
         if isinstance(cmd, str):
@@ -117,12 +122,7 @@ def run(
             tool=_tool_name(stdin_json),
             cwd=_cwd(stdin_json),
             raw_input=_audit_raw(stdin_json),
-            hook_event=(
-                stdin_json.get("hook_event_name")
-                or stdin_json.get("hookEventName")
-                if isinstance(stdin_json.get("hook_event_name") or stdin_json.get("hookEventName"), str)
-                else None
-            ),
+            hook_event=fields.event_name(stdin_json),
         )
         return output
     if request is None:
@@ -142,15 +142,7 @@ def run(
                 tool=_tool_name(stdin_json),
                 cwd=_cwd(stdin_json),
                 raw_input=_audit_raw(stdin_json),
-                hook_event=(
-                    stdin_json.get("hook_event_name")
-                    or stdin_json.get("hookEventName")
-                    if isinstance(
-                        stdin_json.get("hook_event_name") or stdin_json.get("hookEventName"),
-                        str,
-                    )
-                    else None
-                ),
+                hook_event=fields.event_name(stdin_json),
             )
             return output
         return {}

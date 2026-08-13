@@ -10,8 +10,8 @@ from .registry import register
 class FileOutsideCwd(Rule):
     id = "file-outside-cwd"
     severity = "medium"
-    applies_to = ("Write", "Edit", "NotebookEdit")
-    description = "Write/Edit/NotebookEdit 目标路径在 CWD 之外，需用户确认"
+    applies_to = ("Write", "Edit", "NotebookEdit", "Read")
+    description = "Write/Edit/NotebookEdit/Read 目标路径在 CWD 之外，需用户确认"
 
     def match(self, ctx: FileToolContext) -> RuleMatch | None:
         if ctx.classification != "outside":

@@ -122,12 +122,22 @@ def load_records(audit_dir: Path, *, include_fixture: bool = False) -> tuple[lis
     return records, skipped
 
 
+def _expand_cwd(cwd: str) -> str:
+    """审计里的 cwd 可能已脱敏成 $HOME/...，回放前还原。"""
+    if not isinstance(cwd, str) or not cwd:
+        return cwd
+    home = str(Path.home())
+    if cwd.startswith("$HOME"):
+        return home + cwd[len("$HOME"):]
+    return os.path.expandvars(os.path.expanduser(cwd))
+
+
 def _stdin_for(rec: dict) -> dict:
     return {
         "hook_event_name": "PreToolUse",
         "tool_name": "Bash",
         "tool_input": {"command": rec.get("_replay_cmd") or _command_text(rec)},
-        "cwd": rec["cwd"],
+        "cwd": _expand_cwd(rec["cwd"]),
     }
 
 

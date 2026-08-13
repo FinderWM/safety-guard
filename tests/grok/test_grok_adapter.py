@@ -116,9 +116,22 @@ def test_unrelated_event_ignored(grok, cwd: Path):
 
 
 def test_unsupported_tool_fails_closed(grok, cwd: Path):
-    out = grok("read_file", {"target_file": str(cwd / "a.txt")}, cwd)
+    out = grok("spawn_subagent", {"prompt": "x", "description": "x"}, cwd)
     assert out["decision"] == "deny"
     assert "unsupported Grok tool" in out["reason"]
+
+
+def test_read_file_inside_cwd_allow(grok, cwd: Path):
+    target = cwd / "a.txt"
+    target.write_text("hi")
+    out = grok("read_file", {"target_file": str(target)}, cwd)
+    assert out == {"decision": "allow"}
+
+
+def test_read_file_outside_cwd_denied(grok, cwd: Path):
+    out = grok("read_file", {"target_file": "/nonexistent-probe/hosts"}, cwd)
+    assert out["decision"] == "deny"
+    assert "file-outside-cwd" in out["reason"]
 
 
 def test_malformed_tool_input_fails_closed(cwd: Path):

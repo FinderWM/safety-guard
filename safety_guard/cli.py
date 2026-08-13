@@ -35,7 +35,7 @@ def _build_stdin(tool: str, *, command: str | None, path: str | None, cwd: str |
     tool_input: dict = {}
     if tool == "Bash":
         tool_input["command"] = command or ""
-    elif tool in ("Write", "Edit"):
+    elif tool in ("Write", "Edit", "Read"):
         tool_input["file_path"] = path or ""
     elif tool == "NotebookEdit":
         tool_input["notebook_path"] = path or ""
@@ -67,7 +67,7 @@ def _cmd_explain(args) -> int:
     print(f"CWD:      {stdin_json['cwd']}")
     print()
 
-    adapter = get("claude")
+    adapter = get(args.adapter or "claude")
     try:
         request = adapter.parse(stdin_json)
     except ValueError as e:
@@ -138,11 +138,12 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_argument("--selftest", action="store_true", help="跑 tests/ 下全部测试")
     sub.add_argument("--regression", action="store_true", help="跑 regression 命令样本")
 
-    parser.add_argument("--tool", choices=("Bash", "Write", "Edit", "NotebookEdit"), help="工具名")
+    parser.add_argument("--tool", choices=("Bash", "Write", "Edit", "NotebookEdit", "Read"), help="工具名")
     parser.add_argument("--command", help="Bash 命令字符串")
-    parser.add_argument("--path", help="Write/Edit/NotebookEdit 的 file_path")
+    parser.add_argument("--path", help="Write/Edit/NotebookEdit/Read 的 file_path")
     parser.add_argument("--cwd", help="模拟 CWD（默认 os.getcwd()）")
     parser.add_argument("--edit-mode", help="NotebookEdit 的 edit_mode（replace/insert/delete）")
+    parser.add_argument("--adapter", default="claude", help="explain 用的 adapter（默认 claude）")
 
     args = parser.parse_args(argv)
 

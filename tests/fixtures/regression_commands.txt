@@ -120,3 +120,12 @@ ask|ls | xargs rm -rf
 ask|python3 -c 'print(open("/nonexistent-probe/etc/hosts").read()[:1])'
 allow|ls ~/.grok
 allow|cat ./a.json | python3 -m json.tool
+allow|cat /dev/null
+allow|PATH="$PATH" git status
+allow|export PATH="/usr/local/bin:$PATH"
+ask|unlink ./victim.txt
+ask|find . -delete
+ask|git restore .
+ask|curl file:///nonexistent-probe/x
+deny|git push origin :main
+deny|python3 -c 'open("~/.grok/config.toml","w").write("x")'

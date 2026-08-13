@@ -2,21 +2,32 @@
 from __future__ import annotations
 
 import json
-import os
 from typing import Any
 
 from ..contracts import DecisionResult, NormalizedRequest, Operation
+from . import fields
 
 
 _EVENT = "PreToolUse"
-_SUPPORTED_TOOLS = frozenset({"Bash", "Write", "Edit", "NotebookEdit"})
+_READ_TOOLS = frozenset({"Read", "Grep", "Glob"})
+_SUPPORTED_TOOLS = frozenset({"Bash", "Write", "Edit", "NotebookEdit"}) | _READ_TOOLS
+
+
+def _read_path(tool: str, raw_input: dict[str, Any]) -> str:
+    if tool in {"Grep", "Glob"}:
+        path = raw_input.get("path") or raw_input.get("file_path") or "."
+    else:
+        path = raw_input.get("file_path") or raw_input.get("target_file") or raw_input.get("path") or ""
+    if not isinstance(path, str) or not path.strip():
+        raise ValueError("file tool requires a non-empty file_path")
+    return path
 
 
 def _audit_input(tool: str, raw_input: dict[str, Any]) -> str:
     if tool == "Bash":
         command = raw_input.get("command", "")
         return command if isinstance(command, str) else json.dumps(raw_input, ensure_ascii=False)
-    path = raw_input.get("file_path") or raw_input.get("notebook_path")
+    path = raw_input.get("file_path") or raw_input.get("notebook_path") or raw_input.get("path")
     return path if isinstance(path, str) else json.dumps(raw_input, ensure_ascii=False)
 
 
@@ -24,29 +35,34 @@ class ClaudeAdapter:
     name = "claude"
 
     def parse(self, stdin_json: dict[str, Any]) -> NormalizedRequest | None:
-        event = stdin_json.get("hook_event_name") or stdin_json.get("hookEventName")
+        event = fields.event_name(stdin_json)
         if event != _EVENT:
             return None
 
-        tool = stdin_json.get("tool_name") or stdin_json.get("toolName")
+        tool = fields.tool_name(stdin_json)
         if tool not in _SUPPORTED_TOOLS:
             raise ValueError(f"unsupported Claude tool: {tool!r}")
 
-        raw_input = stdin_json.get("tool_input") or stdin_json.get("toolInput") or {}
-        if not isinstance(raw_input, dict):
-            raise ValueError("tool_input must be an object")
+        raw_input = fields.tool_input(stdin_json)
+        cwd = fields.cwd(stdin_json)
 
-        cwd = stdin_json.get("cwd") or os.getcwd()
-        if not isinstance(cwd, str):
-            raise ValueError("cwd must be a string")
+        if tool in _READ_TOOLS:
+            path = _read_path(tool, raw_input)
+            operation = Operation("Read", {"file_path": path})
+            internal = "Read"
+            audit = path
+        else:
+            operation = Operation(tool=tool, tool_input=raw_input)
+            internal = tool
+            audit = _audit_input(tool, raw_input)
 
         return NormalizedRequest(
             adapter=self.name,
             event=_EVENT,
-            tool=tool,
-            operations=(Operation(tool=tool, tool_input=raw_input),),
+            tool=internal,
+            operations=(operation,),
             cwd=cwd,
-            audit_input=_audit_input(tool, raw_input),
+            audit_input=audit,
         )
 
     def render(self, result: DecisionResult) -> dict[str, Any]:

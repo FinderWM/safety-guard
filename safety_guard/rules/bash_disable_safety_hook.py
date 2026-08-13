@@ -15,7 +15,7 @@ from .registry import register
 # 命令名→可能写/删该命令第几个参数（粗略：所有非选项参数都看）
 WRITE_LIKE_COMMANDS = frozenset({
     "rm", "mv", "cp", "tee", "ln", "touch", "truncate", "shred", "unlink",
-    "install",
+    "install", "trash", "trash-put",
 })
 
 

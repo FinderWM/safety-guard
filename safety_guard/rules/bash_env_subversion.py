@@ -51,11 +51,18 @@ _SUBVERSIVE_UNLESS_EMPTY = frozenset({"PATH", "IFS"})
 _EXPORT_BUILTINS = frozenset({"export", "declare", "typeset", "readonly"})
 
 
+def _path_extends_existing(value: str) -> bool:
+    """PATH=$PATH:... / ${PATH} 是扩展，不是整段劫持。"""
+    return "$PATH" in value or "${PATH}" in value
+
+
 def _classify(name: str, value: str) -> str | None:
     """返回命中的级别（'A'/'B'），未命中返回 None。"""
     if name in _SUBVERSIVE_ALWAYS:
         return "A"
     if name in _SUBVERSIVE_UNLESS_EMPTY and value.strip():
+        if name == "PATH" and _path_extends_existing(value):
+            return None
         return "B"
     return None
 

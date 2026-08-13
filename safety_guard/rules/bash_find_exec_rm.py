@@ -3,7 +3,7 @@
 与 bash-find-delete-unbounded（high，仅根/家）分离：
   - `find / -exec rm …`  → high deny（既有规则）
   - `find . -exec rm …`  → medium ask（本规则）
-  - `find . -delete`     → allow（窄口径，语料 FP 考量）
+  - `find . -delete`     → medium ask（本规则）
   - `find . -exec grep…` → allow
 """
 from __future__ import annotations
@@ -24,7 +24,7 @@ class BashFindExecRm(Rule):
     id = "bash-find-exec-rm"
     severity = "medium"
     applies_to = ("Bash",)
-    description = "任意起点 find -exec/-execdir 调用 rm/unlink 需用户确认"
+    description = "任意起点 find -delete 或 -exec rm/unlink 需用户确认"
 
     def match(self, ctx: BashContext) -> RuleMatch | None:
         if ctx.ast is None:
@@ -41,6 +41,17 @@ class BashFindExecRm(Rule):
             if paths and all(is_root_like_path(p) for p in paths):
                 continue
             args_list = list(cmd.args)
+            if any(w.raw == "-delete" for w in args_list):
+                shown_paths = paths or ["."]
+                return RuleMatch(
+                    rule_id=self.id,
+                    severity=self.severity,
+                    reason=(
+                        f"`{ctx.raw_command}` 使用 find -delete，"
+                        f"起点 {', '.join(shown_paths)}；匹配到的文件都会被删除，需确认。"
+                    ),
+                    extra={"exec": "-delete", "paths": shown_paths, "flag": "-delete"},
+                )
             for i, w in enumerate(args_list):
                 if w.raw not in ("-exec", "-execdir"):
                     continue

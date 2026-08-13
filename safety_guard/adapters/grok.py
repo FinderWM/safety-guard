@@ -2,10 +2,10 @@
 from __future__ import annotations
 
 import json
-import os
 from typing import Any
 
 from ..contracts import DecisionResult, NormalizedRequest, Operation
+from . import fields
 
 # Grok stdin 使用 snake_case 事件名；PascalCase 与 matcher 别名一并接受。
 _EVENTS = frozenset({"pre_tool_use", "PreToolUse"})
@@ -16,42 +16,29 @@ _CANONICAL_EVENT = "PreToolUse"
 _BASH_TOOLS = frozenset({
     "run_terminal_command", "Bash", "bash", "shell", "Shell",
 })
-_FILE_TOOLS = frozenset({
+_WRITE_TOOLS = frozenset({
     "search_replace", "Write", "write", "Edit", "edit", "MultiEdit",
 })
+_READ_TOOLS = frozenset({
+    "read_file", "Read", "list_dir", "ListDir", "grep", "Grep", "Glob", "glob",
+})
+_FILE_TOOLS = _WRITE_TOOLS | _READ_TOOLS
 _SUPPORTED_TOOLS = _BASH_TOOLS | _FILE_TOOLS
 
 
-def _event_name(stdin_json: dict[str, Any]) -> str | None:
-    event = stdin_json.get("hook_event_name") or stdin_json.get("hookEventName")
-    return event if isinstance(event, str) else None
-
-
-def _tool_name(stdin_json: dict[str, Any]) -> str | None:
-    tool = stdin_json.get("tool_name") or stdin_json.get("toolName")
-    return tool if isinstance(tool, str) else None
-
-
-def _tool_input(stdin_json: dict[str, Any]) -> dict[str, Any]:
-    raw = stdin_json.get("tool_input") or stdin_json.get("toolInput") or {}
-    if not isinstance(raw, dict):
-        raise ValueError("tool_input must be an object")
-    return raw
-
-
-def _cwd(stdin_json: dict[str, Any]) -> str:
-    cwd = stdin_json.get("cwd") or os.getcwd()
-    if not isinstance(cwd, str):
-        raise ValueError("cwd must be a string")
-    return cwd
-
-
-def _file_path(raw_input: dict[str, Any]) -> str:
-    path = (
-        raw_input.get("file_path")
-        or raw_input.get("target_file")
-        or raw_input.get("path")
-    )
+def _file_path(raw_tool: str, raw_input: dict[str, Any]) -> str:
+    if raw_tool in {"list_dir", "ListDir"}:
+        path = raw_input.get("target_directory") or raw_input.get("path") or raw_input.get("file_path")
+    elif raw_tool in {"grep", "Grep", "Glob", "glob"}:
+        path = raw_input.get("path") or raw_input.get("target_directory") or "."
+    elif raw_tool in {"read_file", "Read"}:
+        path = raw_input.get("target_file") or raw_input.get("file_path") or raw_input.get("path")
+    else:
+        path = (
+            raw_input.get("file_path")
+            or raw_input.get("target_file")
+            or raw_input.get("path")
+        )
     if not isinstance(path, str) or not path.strip():
         raise ValueError("file tool requires a non-empty file_path")
     return path
@@ -67,9 +54,11 @@ def _bash_operation(raw_input: dict[str, Any]) -> tuple[Operation, str]:
 
 
 def _file_operation(raw_tool: str, raw_input: dict[str, Any]) -> tuple[Operation, str]:
-    path = _file_path(raw_input)
+    path = _file_path(raw_tool, raw_input)
     # write / 空 old_string 的 search_replace → 整文件 Write；其余定点 Edit。
-    if raw_tool in {"write", "Write"}:
+    if raw_tool in _READ_TOOLS:
+        internal = "Read"
+    elif raw_tool in {"write", "Write"}:
         internal = "Write"
     elif raw_tool in {"search_replace", "MultiEdit"}:
         old = raw_input.get("old_string", "")
@@ -95,18 +84,18 @@ class GrokAdapter:
     name = "grok"
 
     def parse(self, stdin_json: dict[str, Any]) -> NormalizedRequest | None:
-        event = _event_name(stdin_json)
+        event = fields.event_name(stdin_json)
         if event not in _EVENTS:
             return None
 
-        raw_tool = _tool_name(stdin_json)
+        raw_tool = fields.tool_name(stdin_json)
         if raw_tool is None:
             raise ValueError("missing tool_name")
         if raw_tool not in _SUPPORTED_TOOLS:
             raise ValueError(f"unsupported Grok tool: {raw_tool!r}")
 
-        raw_input = _tool_input(stdin_json)
-        cwd = _cwd(stdin_json)
+        raw_input = fields.tool_input(stdin_json)
+        cwd = fields.cwd(stdin_json)
 
         if raw_tool in _BASH_TOOLS:
             operation, audit = _bash_operation(raw_input)

@@ -42,6 +42,18 @@ def test_edit_outside_cwd_ask(file_tool, cwd: Path):
     assert d == "ask" and "file-outside-cwd" in (reason or "")
 
 
+def test_read_outside_cwd_ask(file_tool, cwd: Path):
+    d, reason = file_tool("Read", "/nonexistent-probe/hosts", cwd)
+    assert d == "ask" and "file-outside-cwd" in (reason or "")
+
+
+def test_read_inside_cwd_allow(file_tool, cwd: Path):
+    target = cwd / "x.txt"
+    target.write_text("hi")
+    d, _ = file_tool("Read", str(target), cwd)
+    assert d == "allow"
+
+
 def test_notebook_delete_ask(file_tool, cwd: Path):
     target = cwd / "x.ipynb"
     target.write_text("{}")

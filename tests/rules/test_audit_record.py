@@ -123,6 +123,27 @@ def test_long_command_truncated_without_body(audit_cfg, tmp_path: Path, monkeypa
     assert rec["cmd_chars"] == len(cmd)
 
 
+def test_match_extra_redacts_home(audit_cfg, tmp_path: Path):
+    cwd = tmp_path / "proj"
+    cwd.mkdir()
+    home = str(Path.home())
+    target = f"{home}/nonexistent-probe-extra.txt"
+    runner.run(
+        {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Edit",
+            "tool_input": {"file_path": target, "old_string": "a", "new_string": "b"},
+            "cwd": str(cwd),
+        },
+        adapter=get("claude"),
+        config=audit_cfg,
+    )
+    rec = _read_all(audit_cfg.audit_dir)[0]
+    blob = json.dumps(rec.get("matches") or [], ensure_ascii=False)
+    assert home not in blob
+    assert "$HOME" in blob
+
+
 def test_home_path_redacted_in_body(audit_cfg, tmp_path: Path):
     cwd = tmp_path / "proj"
     cwd.mkdir()

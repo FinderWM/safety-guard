@@ -29,6 +29,8 @@ BENIGN = [
     "rg -n '/resource-library|Count from|Business routes' .",
     'rg -n "className=\\"[^\"]*(bg-white|bg-slate-50)[^\"]*\\"" web/src | rg -v "dark:"',
     "ls -la .env 2>/dev/null || true",
+    "cat /dev/null",
+    'PATH="$PATH" git status',
     "ps aux | grep python",
     "docker ps",
     "apply_patch <<'PATCH'\n*** Begin Patch\n*** End Patch\nPATCH",

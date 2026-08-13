@@ -68,7 +68,7 @@ class BashContext:
 
 @dataclass
 class FileToolContext:
-    tool: Literal["Write", "Edit", "NotebookEdit"]
+    tool: Literal["Write", "Edit", "NotebookEdit", "Read"]
     raw_input: dict
     target_path: Path
     classification: Classification
@@ -124,8 +124,13 @@ def build(operation: Operation, cwd_raw: str, config: Config) -> ToolContext:
             opaque_payloads=list(ast.opaque_payloads) if ast is not None else [],
         )
 
-    if tool in ("Write", "Edit", "NotebookEdit"):
-        target_raw = raw_input.get("file_path") or raw_input.get("notebook_path") or ""
+    if tool in ("Write", "Edit", "NotebookEdit", "Read"):
+        target_raw = (
+            raw_input.get("file_path")
+            or raw_input.get("notebook_path")
+            or raw_input.get("path")
+            or ""
+        )
         if not isinstance(target_raw, str) or not target_raw:
             raise ValueError(f"{tool} target path must be a non-empty string")
         target_path = _paths.resolve(target_raw, policy)

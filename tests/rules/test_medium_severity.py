@@ -9,6 +9,8 @@ import pytest
 @pytest.mark.parametrize("command,rule_id", [
     ("rm -rf /tmp/some-not-existing-dir",  "bash-rm-targeted"),
     ("rm ./foo",                            "bash-rm-targeted"),
+    ("unlink ./foo",                        "bash-rm-targeted"),
+    ("find . -delete",                      "bash-find-exec-rm"),
     ("rm -rf ./build",                      "bash-rm-targeted"),
     ("git reset --hard",                    "bash-git-destructive"),
     ("git clean -fd",                       "bash-git-destructive"),

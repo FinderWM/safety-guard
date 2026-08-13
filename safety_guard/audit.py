@@ -142,12 +142,24 @@ def _cmd_fields(raw_input: str) -> dict[str, Any]:
     return fields
 
 
+def _redact_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return _redact(value)
+    if isinstance(value, list):
+        return [_redact_value(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _redact_value(v) for k, v in value.items()}
+    return value
+
+
 def _redact_matches(matches: list[dict]) -> list[dict]:
     out: list[dict] = []
     for m in matches:
         mm = dict(m)
         if isinstance(mm.get("reason"), str):
             mm["reason"] = _redact(mm["reason"])
+        if isinstance(mm.get("extra"), dict):
+            mm["extra"] = _redact_value(mm["extra"])
         out.append(mm)
     return out
 

@@ -32,6 +32,8 @@ DESTRUCTIVE = [
     "git -C . stash drop",
     "git -C . worktree remove ../wt",
     "git -C . rebase origin/main",
+    "git restore .",
+    "git checkout -- existing.txt",
     f"rtk git -C {OUT} clean -fd",
     f"bash -c 'git -C {OUT} clean -fd'",
 ]
@@ -55,6 +57,8 @@ SAFE = [
     "git -C . stash list",
     "git clean -n",          # dry-run，无 -f
     "git branch -d topic",   # 非强制删除
+    "git restore --staged .",
+    "git checkout main",
 ]
 
 

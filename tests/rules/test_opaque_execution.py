@@ -29,6 +29,7 @@ MUST_ASK = [
     ("find . -exec rm -f {} +", "bash-find-exec-rm"),
     ("find ./build -execdir /bin/rm {} ;", "bash-find-exec-rm"),
     ("find ./tmp -exec unlink {} +", "bash-find-exec-rm"),
+    ("find . -name x -delete", "bash-find-exec-rm"),
 ]
 
 
@@ -48,7 +49,6 @@ def test_find_root_exec_rm_still_high(bash, cwd: Path):
 # --- 良性：仍 allow ------------------------------------------------------------
 
 BENIGN = [
-    "find . -name x -delete",
     "find . -name '*.java' -exec grep -l x {} ;",
     "find ./src -exec grep -n TODO {} +",
     "bash -c 'cat ./f'",

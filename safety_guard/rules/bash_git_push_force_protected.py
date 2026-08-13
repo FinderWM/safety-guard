@@ -23,10 +23,28 @@ def _is_force(words) -> bool:
     return False
 
 
+def _normalize_branch(token: str) -> str:
+    """去掉 + / : 前缀和 refs/heads/，得到分支名。"""
+    t = token[1:] if token.startswith("+") else token
+    if t.startswith(":"):
+        t = t[1:]
+    elif ":" in t:
+        t = t.split(":", 1)[-1]
+    for prefix in ("refs/heads/", "refs/remotes/origin/"):
+        if t.startswith(prefix):
+            t = t[len(prefix):]
+    return t
+
+
 def _branch_from_refspec(token: str) -> str:
     """去掉强制前缀 +，再取 refspec 右侧（远端分支）。"""
-    t = token[1:] if token.startswith("+") else token
-    return t.split(":")[-1] if ":" in t else t
+    return _normalize_branch(token)
+
+
+def _is_delete_push(args: list[str]) -> bool:
+    if "--delete" in args or "-d" in args:
+        return True
+    return any(a.startswith(":") and len(a) > 1 and not a.startswith("--") for a in args)
 
 
 @register
@@ -45,31 +63,43 @@ class BashGitPushForceProtected(Rule):
             args = [w.raw for w in cmd.args]
             if "push" not in args:
                 continue
-            if not _is_force(cmd.words):
-                continue
-            # 找 refspec：push 后面除选项外的最后一个非空 token，可能是 branch 或 remote:branch
             push_idx = args.index("push")
             tail = [a for a in args[push_idx + 1 :] if not a.startswith("-")]
+            deleting = _is_delete_push(args[push_idx + 1 :])
+            forcing = _is_force(cmd.words)
+            if not deleting and not forcing:
+                continue
             if len(tail) < 1:
-                # 没显式指定，按当前分支推—保守起见也拦
-                return RuleMatch(
-                    rule_id=self.id,
-                    severity=self.severity,
-                    reason=(
-                        f"拒绝执行：`{ctx.raw_command}` force-push 未指定分支，"
-                        f"可能将本地强推到默认上游（往往是 main/master）。请显式指定非保护分支后重试。"
-                    ),
-                )
+                if forcing:
+                    return RuleMatch(
+                        rule_id=self.id,
+                        severity=self.severity,
+                        reason=(
+                            f"拒绝执行：`{ctx.raw_command}` force-push 未指定分支，"
+                            f"可能将本地强推到默认上游（往往是 main/master）。请显式指定非保护分支后重试。"
+                        ),
+                    )
+                continue
             target = tail[-1]
             branch = _branch_from_refspec(target)
-            if is_protected_branch(branch, ctx.config.protected_branches):
+            if not is_protected_branch(branch, ctx.config.protected_branches):
+                continue
+            if deleting:
                 return RuleMatch(
                     rule_id=self.id,
                     severity=self.severity,
                     reason=(
-                        f"拒绝执行：`{ctx.raw_command}` 将 force-push 到受保护分支 `{branch}`。"
-                        f"如需强推非保护分支，请显式指定分支名。"
+                        f"拒绝执行：`{ctx.raw_command}` 将删除远端受保护分支 `{branch}`。"
                     ),
-                    extra={"branch": branch},
+                    extra={"branch": branch, "mode": "delete"},
                 )
+            return RuleMatch(
+                rule_id=self.id,
+                severity=self.severity,
+                reason=(
+                    f"拒绝执行：`{ctx.raw_command}` 将 force-push 到受保护分支 `{branch}`。"
+                    f"如需强推非保护分支，请显式指定分支名。"
+                ),
+                extra={"branch": branch},
+            )
         return None

@@ -199,6 +199,7 @@ def looks_like_potentially_outside_path(token: str) -> bool:
     """
     if not token:
         return False
+    token = strip_file_uri(token)
     if token.startswith("-"):
         return False
     if _starts_outside(token) or has_traversal(token):
@@ -282,8 +283,42 @@ def iter_path_args(name: str, args: list) -> list:
     return [a for a in args if not getattr(a, "raw", str(a)).startswith("-")]
 
 
+_VIRTUAL_DEVICES = frozenset({
+    "/dev/null", "/dev/zero", "/dev/full",
+    "/dev/random", "/dev/urandom",
+    "/dev/stdin", "/dev/stdout", "/dev/stderr",
+    "/dev/tty", "/dev/console",
+})
+
+
+def is_virtual_device_path(path: Path | str) -> bool:
+    """/dev/null、/dev/zero 等不是跨 CWD 的真实文件。"""
+    text = str(path)
+    if text in _VIRTUAL_DEVICES:
+        return True
+    return text.startswith("/dev/fd/") or text.startswith("/dev/pts/")
+
+
 def is_null_device_path(path: Path) -> bool:
-    return str(path) == "/dev/null"
+    return is_virtual_device_path(path)
+
+
+def strip_file_uri(token: str) -> str:
+    """`file:///etc/passwd` → `/etc/passwd`；非 file: 原文返回。"""
+    if not token:
+        return token
+    lower = token.lower()
+    if lower.startswith("file://"):
+        rest = token[7:]
+        if rest.lower().startswith("localhost"):
+            rest = rest[9:]
+        if rest.startswith("/"):
+            return rest
+        return "/" + rest if rest else token
+    if lower.startswith("file:"):
+        rest = token[5:]
+        return rest if rest.startswith("/") else token
+    return token
 
 
 # ---------------------------------------------------------------------------
@@ -311,7 +346,11 @@ INTERPRETERS = frozenset({
 # 所以把 argv 排除掉不会漏防：`echo x > <外部路径>` 仍由 redirect 命中。
 # 不排除的话「未知命令 → 全部 argv 算写目标」的兜底会把数据当路径：
 # `echo '../../x' >> ./.gitignore` 里的 `../../x` 只是要写进文件的一行文本。
-DATA_ONLY_COMMANDS = frozenset({"echo", "printf", "seq", "sleep", "expr", "true", "false", ":"})
+DATA_ONLY_COMMANDS = frozenset({
+    "echo", "printf", "seq", "sleep", "expr", "true", "false", ":",
+    # 赋值内建：`export PATH=/usr/local/bin:$PATH` 的值不是写目标
+    "export", "declare", "typeset", "readonly", "unset", "local",
+})
 
 # 任何命令下都按「只读配置」处理的选项，其值不算写目标
 _READ_ONLY_VALUE_OPTS_ANY = frozenset({
@@ -434,6 +473,8 @@ def iter_read_sources(name: str, args: list, read_only_commands: frozenset[str])
         for a in args:
             raw = getattr(a, "raw", str(a))
             if "@" in raw and not raw.startswith("-"):
+                out.append(a)
+            if raw.lower().startswith("file:"):
                 out.append(a)
         out.extend(_option_values(args, frozenset({"-T", "--upload-file"})))
         return out

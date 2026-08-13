@@ -70,11 +70,12 @@ safety_guard/
 │   ├── claude.py
 │   ├── codex.py         # PreToolUse + PermissionRequest + apply_patch 解析
 │   ├── grok.py          # Grok pre_tool_use / 顶层 decision
+│   ├── fields.py        # tool_input / cwd 字段别名
 │   └── registry.py
 ├── rules/
 │   ├── base.py
 │   ├── registry.py      # 按模块名字典序显式 import 并 @register
-│   └── <rule>.py        # 当前 35 条
+│   └── <rule>.py        # 当前 37 条
 ├── contracts.py         # Operation / NormalizedRequest / DecisionResult
 ├── runner.py            # stdin ↔ Adapter ↔ Engine
 ├── engine.py            # 聚合决策 + 审计
@@ -84,6 +85,7 @@ safety_guard/
 ├── bash_ast.py          # bashlex 封装、wrapper 剥离、opaque 收集
 ├── expand.py            # brace / ANSI-C / 反斜杠确定性展开
 ├── folding.py           # 赋值序列常量折叠（$HOME 等）
+├── interp.py            # 解释器 -c/-e 载荷抽路径/写删
 ├── paths.py             # in-cwd / instruction-zone / outside
 ├── helpers.py           # 规则共用：路径槽、只读判定、分支 glob 等
 └── cli.py
@@ -216,10 +218,10 @@ command
 
 | Adapter 名 | 平台事件 | 输入工具 |
 | --- | --- | --- |
-| `claude` | Claude Code `PreToolUse` | `Bash` / `Write` / `Edit` / `NotebookEdit` |
+| `claude` | Claude Code `PreToolUse` | `Bash` / `Write` / `Edit` / `NotebookEdit` / `Read` / `Grep` / `Glob` |
 | `codex-pretool` | Codex `PreToolUse` | `Bash`/`shell` + `apply_patch` |
 | `codex-permission` | Codex `PermissionRequest` | 同上 |
-| `grok` | Grok `pre_tool_use` / `PreToolUse` | `run_terminal_command` / `write` / `search_replace`（及 Bash/Write/Edit 别名） |
+| `grok` | Grok `pre_tool_use` / `PreToolUse` | `run_terminal_command` / `write` / `search_replace` / `read_file` / `list_dir` / `grep`（及 Bash/Write/Edit/Read 别名） |
 
 选择优先级：
 
@@ -253,6 +255,8 @@ python3 safety-guard.py --adapter grok
 - 输入兼容 camelCase（`hookEventName` / `toolName` / `toolInput`）与 snake_case
 - `search_replace`：空 `old_string` → 内部 `Write`；非空 → 内部 `Edit`
 - 原生工具名 `write`（小写）映射为内部 `Write`
+- `read_file` / `list_dir` / `grep`（及 Claude `Read`/`Grep`/`Glob`）映射为内部 `Read`；指令区只读仍豁免
+- `tool_input` 兼容 `arguments` / `input`；`cwd` 兼容 `workspace_path` / `working_directory`
 
 ### Codex `apply_patch` → 多 Operation
 
@@ -394,7 +398,7 @@ class ExampleRule(Rule):
 `ctx.classify()`；文件工具用 `ctx.target_path` / `ctx.classification` /
 `ctx.file_exists` / `ctx.patch_action`。共用逻辑放 `helpers.py`，不要在规则里重解析命令。
 
-### 当前规则一览（35）
+### 当前规则一览（37）
 
 `python3 safety-guard.py --list-rules` 可打印完整描述。
 
@@ -413,6 +417,7 @@ class ExampleRule(Rule):
 | `bash-rm-root-or-home` | Bash | `rm` 目标为 `/` 或 `$HOME` |
 | `bash-sql-drop-database` | Bash | `DROP DATABASE` / `DROP SCHEMA` |
 | `file-critical-path-write` | Write/Edit/NotebookEdit | 写入 critical_paths |
+| `bash-interpreter-write` | Bash | 解释器 -c/-e 写/删 critical_paths |
 
 ### medium → ask
 
@@ -420,7 +425,9 @@ class ExampleRule(Rule):
 | --- | --- | --- |
 | `bash-cp-mv-overwrite-existing` | Bash | `cp`/`mv` 覆盖已存在目标 |
 | `bash-credential-export` | Bash | gpg/security/kubectl 等凭据导出或密钥读取 |
-| `bash-find-exec-rm` | Bash | 非根/家起点 `find -exec/-execdir` + rm 家族 |
+| `bash-find-exec-rm` | Bash | 非根/家起点 `find -delete` 或 `-exec` + rm 家族 |
+| `bash-interpreter-write` | Bash | 解释器 -c/-e 写/删非 critical 文件 |
+| `bash-util-overwrite-existing` | Bash | `truncate` / `dd of=` 覆盖已存在文件 |
 | `bash-gh-close` | Bash | `gh` 关闭/删除远端资源 |
 | `bash-git-destructive` | Bash | `reset --hard` / `clean -f` / `branch -D` 等 |
 | `bash-instruction-zone-write` | Bash | 写指令区 |
@@ -438,7 +445,7 @@ class ExampleRule(Rule):
 | `bash-tee-overwrite-existing` | Bash | 无 `-a` 的 `tee` |
 | `bash-unresolvable-path` | Bash | 路径槽静态不可解释 |
 | `file-instruction-zone-write` | Write/Edit/NotebookEdit | 写指令区 |
-| `file-outside-cwd` | Write/Edit/NotebookEdit | 目标在 CWD 外 |
+| `file-outside-cwd` | Write/Edit/NotebookEdit/Read | 目标在 CWD 外 |
 | `file-overwrite-existing` | Write | 整文件覆盖 |
 | `file-patch-delete` | Edit | apply_patch 删除 |
 | `notebook-delete` | NotebookEdit | `edit_mode=delete` |
@@ -512,7 +519,7 @@ SAFETY_GUARD_FAIL_OPEN=1 python3 safety-guard.py --adapter codex-pretool
 | `process-subst` | `bash <(curl …)` / `source <(…)` / `. <(…)` | 同上 |
 | `find-exec` | `find … -exec/-execdir …` | 仅结构标记；rm 家族由 `bash-find-exec-rm` ask |
 
-`find / … -exec rm` 仍由 `bash-find-delete-unbounded`（high）deny；`find . -delete` 故意 allow；`find . -exec grep` allow。
+`find / … -exec rm` 仍由 `bash-find-delete-unbounded`（high）deny；`find . -delete` 与 `find . -exec rm` 由 `bash-find-exec-rm` ask；`find . -exec grep` allow。
 
 ## 调试命令
 
