@@ -12,10 +12,11 @@ from __future__ import annotations
 
 import os
 import tomllib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import bash_ast as _bash_ast
+from .bash_ast import WrapperSpec
 
 
 _FAIL_OPEN_ENV = "SAFETY_GUARD_FAIL_OPEN"
@@ -69,6 +70,7 @@ def _defaults() -> dict:
         # 前缀包装命令：剥掉后按内层真命令分发规则。
         # 不剥的话 `rtk rm -rf /` / `sudo rm -rf /` 会绕过全部按命令名匹配的规则。
         "wrapper_commands": list(_bash_ast.DEFAULT_WRAPPERS),
+        "wrapper_specs": {},
         # 默认只自保护——把 hook 自身和入口脚本列入。CLI 特定的路径（如 ~/.claude/settings.json）
         # 由各 CLI 的 safety_guard.toml 自行追加。
         "critical_paths": [
@@ -104,6 +106,7 @@ class Config:
     audit_max_total_mb: int
     # 带默认值，保证 load() 未显式传入时也能构造（避免改配置时把 hook 锁死）
     wrapper_commands: frozenset[str] = frozenset(_bash_ast.DEFAULT_WRAPPERS)
+    wrapper_specs: dict[str, WrapperSpec] = field(default_factory=lambda: dict(_bash_ast.DEFAULT_WRAPPER_SPECS))
 
 
 def _expand_path(p: str) -> Path:
@@ -131,6 +134,8 @@ def _minimal_config() -> Config:
         audit_retention_days=7,
         audit_max_file_mb=5,
         audit_max_total_mb=50,
+        wrapper_commands=frozenset(_bash_ast.DEFAULT_WRAPPERS),
+        wrapper_specs=dict(_bash_ast.DEFAULT_WRAPPER_SPECS),
     )
 
 
@@ -153,7 +158,10 @@ def _load(path: Path | None = None) -> Config:
             if "critical_paths" in user:
                 merged = list(dict.fromkeys(list(raw["critical_paths"]) + list(user["critical_paths"])))
                 user["critical_paths"] = merged
+            user_wrapper_specs = user.get("wrapper_specs")
             raw.update(user)
+            if isinstance(user_wrapper_specs, dict):
+                raw["wrapper_specs"] = user_wrapper_specs
         except (OSError, tomllib.TOMLDecodeError):
             # 解析失败用默认值；engine 层有 fail-closed 兜底
             pass
@@ -180,5 +188,14 @@ def _load(path: Path | None = None) -> Config:
         audit_retention_days=int(raw["audit_retention_days"]),
         audit_max_file_mb=int(raw["audit_max_file_mb"]),
         audit_max_total_mb=int(raw["audit_max_total_mb"]),
-        wrapper_commands=frozenset(raw.get("wrapper_commands") or _bash_ast.DEFAULT_WRAPPERS),
+        wrapper_commands=_wrapper_command_names(raw),
+        wrapper_specs=_bash_ast.merge_wrapper_specs(raw.get("wrapper_specs")),
     )
+
+
+def _wrapper_command_names(raw: dict) -> frozenset[str]:
+    names = set(raw.get("wrapper_commands") or _bash_ast.DEFAULT_WRAPPERS)
+    specs = raw.get("wrapper_specs")
+    if isinstance(specs, dict):
+        names.update(k for k in specs if isinstance(k, str) and k)
+    return frozenset(names)

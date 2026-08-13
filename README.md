@@ -146,7 +146,8 @@ python3 safety-guard.py --explain --tool Write --path ./README.md
 | `protected_branches` | force-push 保护分支（默认 `main` / `master` / `release/*`） |
 | `read_only_zones` | 读豁免区（写仍 ask） |
 | `read_only_commands` | 只读命令白名单 |
-| `wrapper_commands` | 前缀包装（`rtk` / `sudo` / `env` …） |
+| `wrapper_commands` | 前缀包装（`rtk` / `sudo` / `env` …）；只加名字即可当纯前缀剥 |
+| `wrapper_specs.<name>` | 包装怎么剥：`value_opts` / `skip_positional` / `subcommands` |
 | `critical_paths` | 高危路径（**与默认自保合并**，不会丢掉入口脚本保护） |
 | `fail_open` / `dry_run` | 异常放行 / 只审计不拦截 |
 | `audit_*` | 审计目录与保留策略 |

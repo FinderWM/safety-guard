@@ -103,7 +103,11 @@ def build(operation: Operation, cwd_raw: str, config: Config) -> ToolContext:
             raise ValueError("Bash command must be a string")
         try:
             if cmd.strip():
-                ast = _bash_ast.expand(_bash_ast.parse(cmd), config.wrapper_commands)
+                ast = _bash_ast.expand(
+                    _bash_ast.parse(cmd),
+                    config.wrapper_commands,
+                    config.wrapper_specs,
+                )
             else:
                 ast = _bash_ast.BashAst(raw=cmd, commands=[], pipelines=[], redirects=[])
             parse_error = None

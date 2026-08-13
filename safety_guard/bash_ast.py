@@ -152,33 +152,64 @@ def parse(command: str) -> BashAst:
 # 展开一层前缀后两边同时修好。
 # ---------------------------------------------------------------------------
 
+@dataclass(frozen=True)
+class WrapperSpec:
+    """单个包装命令的剥层语义。名字在 wrapper_commands 里即可剥；本结构只描述怎么剥。
+
+    简单前缀（nohup / setsid）三项都空。env -S / xargs -a 仍走代码特判。
+    """
+
+    value_opts: frozenset[str] = frozenset()
+    skip_positional: int = 0
+    subcommands: frozenset[str] = frozenset()
+
+
 DEFAULT_WRAPPERS: tuple[str, ...] = (
     "rtk", "sudo", "doas", "env", "nohup", "command", "builtin", "exec",
     "nice", "ionice", "stdbuf", "time", "timeout", "xargs", "setsid",
     "proxychains", "proxychains4",
 )
 
-# 包装命令自身「带值」的选项：命中后跳过选项 + 它的值
-_WRAPPER_VALUE_OPTS: dict[str, frozenset[str]] = {
-    "sudo": frozenset({"-u", "--user", "-g", "--group", "-p", "--prompt", "-C", "--close-from", "-h", "--host"}),
-    "doas": frozenset({"-u", "-C"}),
-    "env": frozenset({"-u", "--unset", "-C", "--chdir", "-S", "--split-string"}),
-    "nice": frozenset({"-n", "--adjustment"}),
-    "ionice": frozenset({"-c", "-n", "-p"}),
-    "stdbuf": frozenset({"-i", "-o", "-e", "--input", "--output", "--error"}),
-    "timeout": frozenset({"-s", "--signal", "-k", "--kill-after"}),
-    "xargs": frozenset({"-I", "-i", "-n", "-P", "-d", "-E", "-s", "-L", "-a",
-                        "--replace", "--max-args", "--max-procs", "--delimiter",
-                        "--max-lines", "--arg-file", "--eof"}),
+DEFAULT_WRAPPER_SPECS: dict[str, WrapperSpec] = {
+    "sudo": WrapperSpec(value_opts=frozenset({
+        "-u", "--user", "-g", "--group", "-p", "--prompt", "-C", "--close-from", "-h", "--host",
+    })),
+    "doas": WrapperSpec(value_opts=frozenset({"-u", "-C"})),
+    "env": WrapperSpec(value_opts=frozenset({"-u", "--unset", "-C", "--chdir", "-S", "--split-string"})),
+    "nice": WrapperSpec(value_opts=frozenset({"-n", "--adjustment"})),
+    "ionice": WrapperSpec(value_opts=frozenset({"-c", "-n", "-p"})),
+    "stdbuf": WrapperSpec(value_opts=frozenset({"-i", "-o", "-e", "--input", "--output", "--error"})),
+    "timeout": WrapperSpec(
+        value_opts=frozenset({"-s", "--signal", "-k", "--kill-after"}),
+        skip_positional=1,
+    ),
+    "xargs": WrapperSpec(value_opts=frozenset({
+        "-I", "-i", "-n", "-P", "-d", "-E", "-s", "-L", "-a",
+        "--replace", "--max-args", "--max-procs", "--delimiter",
+        "--max-lines", "--arg-file", "--eof",
+    })),
+    "rtk": WrapperSpec(subcommands=frozenset({"proxy", "exec", "run"})),
 }
 
-# 包装命令在选项之后还要吃掉的位置参数个数（timeout 的 DURATION）
-_WRAPPER_SKIP_POSITIONAL: dict[str, int] = {"timeout": 1}
 
-# 包装命令自己的子命令，跳过后才是真命令（rtk proxy <cmd>）
-_WRAPPER_SKIP_SUBCOMMAND: dict[str, frozenset[str]] = {
-    "rtk": frozenset({"proxy", "exec", "run"}),
-}
+def merge_wrapper_specs(user: dict | None) -> dict[str, WrapperSpec]:
+    """默认 spec + 用户 overlay。用户可只改某一项，其余继承默认。"""
+    out = dict(DEFAULT_WRAPPER_SPECS)
+    if not user:
+        return out
+    for name, raw in user.items():
+        if not isinstance(name, str) or not name or not isinstance(raw, dict):
+            continue
+        base = out.get(name, WrapperSpec())
+        value_opts = raw.get("value_opts", None)
+        skip_pos = raw.get("skip_positional", None)
+        subs = raw.get("subcommands", None)
+        out[name] = WrapperSpec(
+            value_opts=frozenset(value_opts) if value_opts is not None else base.value_opts,
+            skip_positional=int(skip_pos) if skip_pos is not None else base.skip_positional,
+            subcommands=frozenset(subs) if subs is not None else base.subcommands,
+        )
+    return out
 
 _MAX_UNWRAP_DEPTH = 4
 
@@ -194,15 +225,20 @@ def _words_from_shell_string(text: str) -> list[WordSpec] | None:
     return [_token_word(t) for t in tokens]
 
 
-def _unwrap_once(cmd: CommandSpec, wrappers: frozenset[str]) -> CommandSpec | None:
+def _unwrap_once(
+    cmd: CommandSpec,
+    wrappers: frozenset[str],
+    specs: dict[str, WrapperSpec] | None = None,
+) -> CommandSpec | None:
     """剥掉一层包装前缀；不是包装命令或剥完没内容则返回 None。"""
     name = normalize_cmd_name(cmd.name)
     if name not in wrappers or len(cmd.words) < 2:
         return None
 
-    value_opts = _WRAPPER_VALUE_OPTS.get(name, frozenset())
-    skip_positional = _WRAPPER_SKIP_POSITIONAL.get(name, 0)
-    subcommands = _WRAPPER_SKIP_SUBCOMMAND.get(name, frozenset())
+    spec = (specs or DEFAULT_WRAPPER_SPECS).get(name, WrapperSpec())
+    value_opts = spec.value_opts
+    skip_positional = spec.skip_positional
+    subcommands = spec.subcommands
 
     carried: list[AssignSpec] = []
     inherited_reads: list[WordSpec] = list(getattr(cmd, "extra_reads", None) or [])
@@ -334,11 +370,15 @@ def _peel_multicall(cmd: CommandSpec) -> CommandSpec:
     )
 
 
-def unwrap_command(cmd: CommandSpec, wrappers: frozenset[str]) -> CommandSpec:
+def unwrap_command(
+    cmd: CommandSpec,
+    wrappers: frozenset[str],
+    specs: dict[str, WrapperSpec] | None = None,
+) -> CommandSpec:
     """反复剥掉包装前缀，直到 argv[0] 是真命令（如 `sudo env A=1 rtk rm`）。"""
     current = cmd
     for _ in range(_MAX_UNWRAP_DEPTH):
-        nxt = _unwrap_once(current, wrappers)
+        nxt = _unwrap_once(current, wrappers, specs)
         if nxt is None:
             break
         current = nxt
@@ -649,7 +689,11 @@ def _collect_structural_opaque(cmd: CommandSpec) -> list[OpaquePayload]:
     return found
 
 
-def expand(ast: BashAst, wrappers: frozenset[str]) -> BashAst:
+def expand(
+    ast: BashAst,
+    wrappers: frozenset[str],
+    specs: dict[str, WrapperSpec] | None = None,
+) -> BashAst:
     """展开包装前缀 + 内联 shell 脚本，返回规则可直接消费的 AST。
 
     原地重建 commands / pipelines.stages，使两者指向同一批 CommandSpec。
@@ -659,7 +703,7 @@ def expand(ast: BashAst, wrappers: frozenset[str]) -> BashAst:
     def _u(c: CommandSpec) -> CommandSpec:
         key = id(c)
         if key not in unwrapped:
-            unwrapped[key] = unwrap_command(c, wrappers)
+            unwrapped[key] = unwrap_command(c, wrappers, specs)
         return unwrapped[key]
 
     commands = [_u(c) for c in ast.commands]
@@ -679,7 +723,7 @@ def expand(ast: BashAst, wrappers: frozenset[str]) -> BashAst:
         opaque.extend(_collect_structural_opaque(c))
         for payload in literals:
             try:
-                sub = expand(parse(payload), wrappers)
+                sub = expand(parse(payload), wrappers, specs)
             except (BashParseError, RecursionError):
                 continue
             extra.extend(sub.commands)

@@ -52,6 +52,14 @@ wrapper_commands = [
   "proxychains", "proxychains4",
 ]
 
+# 包装剥层语义。只加名字：写进上面的 wrapper_commands 即可（当纯前缀剥）。
+# 需要跳过「带值选项 / 位置参数 / 自身子命令」时在 [wrapper_specs.NAME] 补：
+#   value_opts        = ["-n", "--interval"]
+#   skip_positional   = 1          # timeout 的 DURATION
+#   subcommands       = ["proxy"]  # rtk proxy <cmd>
+# 只写 [wrapper_specs.chronic] 也会自动把 chronic 加进剥层名单。
+# 同名会覆盖代码内置默认的对应字段；env -S / xargs -a 仍走代码特判。
+
 # 高危覆写保护：任何 bash 命令试图写入这些路径直接 deny
 # 默认会自动保护 hook 自身（入口脚本 + safety_guard 包目录），下面是各 CLI 的额外保护：
 critical_paths = [

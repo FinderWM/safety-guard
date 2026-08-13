@@ -495,6 +495,7 @@ SAFETY_GUARD_FAIL_OPEN=1 python3 safety-guard.py --adapter codex-pretool
 | `read_only_zones` | 指令区等：读豁免、写仍 ask |
 | `read_only_commands` | 只读命令白名单 |
 | `wrapper_commands` | 前缀包装命令（剥掉后按内层分发） |
+| `wrapper_specs.<name>` | 包装剥层语义：`value_opts` / `skip_positional` / `subcommands` |
 | `critical_paths` | 高危路径（与默认自保合并） |
 | `fail_open` / `dry_run` | 行为开关 |
 | `audit_dir` / `audit_retention_days` / `audit_max_*_mb` | 审计 |

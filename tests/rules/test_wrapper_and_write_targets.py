@@ -53,6 +53,72 @@ def test_wrapper_without_inner_command_kept(command: str):
     assert names and names[0] == command.split()[0]
 
 
+def test_config_adds_simple_wrapper(tmp_path: Path):
+    """只把新名字写进 wrapper_commands，按纯前缀剥。"""
+    cfg_path = tmp_path / "safety_guard.toml"
+    cfg_path.write_text(
+        "wrapper_commands = [\"chronic\", \"sudo\"]\n",
+        encoding="utf-8",
+    )
+    from safety_guard.config import load as load_config
+
+    cfg = load_config(cfg_path)
+    assert "chronic" in cfg.wrapper_commands
+    ast = bash_ast.expand(
+        bash_ast.parse("chronic rm -rf /"),
+        cfg.wrapper_commands,
+        cfg.wrapper_specs,
+    )
+    assert [c.name for c in ast.commands] == ["rm"]
+
+
+def test_config_wrapper_spec_skip_positional(tmp_path: Path):
+    """新包装带 skip_positional / value_opts，不必改代码。"""
+    cfg_path = tmp_path / "safety_guard.toml"
+    cfg_path.write_text(
+        "\n".join([
+            "[wrapper_specs.watch]",
+            'value_opts = ["-n", "--interval"]',
+            "",
+            "[wrapper_specs.wrap]",
+            "skip_positional = 1",
+            "",
+        ]),
+        encoding="utf-8",
+    )
+    from safety_guard.config import load as load_config
+
+    cfg = load_config(cfg_path)
+    assert "watch" in cfg.wrapper_commands
+    assert "wrap" in cfg.wrapper_commands
+    ast = bash_ast.expand(
+        bash_ast.parse("watch -n 2 rm -rf ./x"),
+        cfg.wrapper_commands,
+        cfg.wrapper_specs,
+    )
+    assert [c.name for c in ast.commands] == ["rm"]
+    ast = bash_ast.expand(
+        bash_ast.parse("wrap 5 rm -rf ./x"),
+        cfg.wrapper_commands,
+        cfg.wrapper_specs,
+    )
+    assert [c.name for c in ast.commands] == ["rm"]
+
+
+def test_config_wrapper_spec_does_not_drop_defaults(tmp_path: Path):
+    cfg_path = tmp_path / "safety_guard.toml"
+    cfg_path.write_text("[wrapper_specs.chronic]\n", encoding="utf-8")
+    from safety_guard.config import load as load_config
+
+    cfg = load_config(cfg_path)
+    ast = bash_ast.expand(
+        bash_ast.parse("timeout 30 rm -rf /tmp/x"),
+        cfg.wrapper_commands,
+        cfg.wrapper_specs,
+    )
+    assert "rm" in [c.name for c in ast.commands]
+
+
 def test_wrapper_records_prefix():
     cfg = load_config()
     ast = bash_ast.expand(bash_ast.parse("sudo rtk rm -rf /tmp/x"), cfg.wrapper_commands)
