@@ -230,3 +230,19 @@ def test_broken_config_still_denies_dangerous(monkeypatch, bash, cwd: Path):
     monkeypatch.setattr(config_mod, "_defaults", boom)
     assert bash("echo hi", cwd)[0] == "allow"
     assert bash("rm -rf /", cwd)[0] == "deny"
+
+
+def test_invalid_config_keeps_all_platform_control_files_protected(tmp_path: Path):
+    from safety_guard import config as config_mod
+
+    config_path = tmp_path / "invalid.toml"
+    config_path.write_text("critical_paths = [", encoding="utf-8")
+
+    cfg = config_mod.load(config_path)
+
+    assert cfg.load_error == "config_parse_error"
+    assert Path.home() / ".claude" / "settings.json" in cfg.critical_paths
+    assert Path.home() / ".codex" / "config.toml" in cfg.critical_paths
+    assert Path.home() / ".codex" / "hooks.json" in cfg.critical_paths
+    assert Path.home() / ".grok" / "config.toml" in cfg.critical_paths
+    assert Path.home() / ".grok" / "hooks" in cfg.critical_paths

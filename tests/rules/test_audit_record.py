@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 from dataclasses import replace
 from pathlib import Path
 
@@ -163,6 +164,83 @@ def test_home_path_redacted_in_body(audit_cfg, tmp_path: Path):
     body = rec.get("cmd_body") or ""
     assert home not in body
     assert "$HOME" in body
+
+
+@pytest.mark.parametrize(
+    ("command", "secret"),
+    [
+        ("API_KEY=synthetic-api-value run-tool", "synthetic-api-value"),
+        ("OPENAI_API_KEY=synthetic-vendor-api-value run-tool", "synthetic-vendor-api-value"),
+        ("run-tool --access-token synthetic-token-value", "synthetic-token-value"),
+        ("curl -H 'Authorization: Bearer synthetic-bearer-value' https://example.invalid", "synthetic-bearer-value"),
+        ("run-tool --password='synthetic-password-value'", "synthetic-password-value"),
+        ("PASSWORD='synthetic password with spaces' run-tool", "synthetic password with spaces"),
+        ("run-tool --password 'synthetic option password with spaces'", "synthetic option password with spaces"),
+        ("printf '%s' '{\"api_key\":\"synthetic-json-api-value\"}'", "synthetic-json-api-value"),
+        ("printf '%s' '{\"Authorization\":\"Bearer synthetic-json-bearer\"}'", "synthetic-json-bearer"),
+    ],
+)
+def test_credentials_are_redacted_from_audit_body(
+    audit_cfg,
+    tmp_path: Path,
+    command: str,
+    secret: str,
+):
+    cwd = tmp_path / "proj"
+    cwd.mkdir()
+    runner.run(
+        {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": command},
+            "cwd": str(cwd),
+        },
+        adapter=get("claude"),
+        config=audit_cfg,
+    )
+    blob = json.dumps(_read_all(audit_cfg.audit_dir)[0], ensure_ascii=False)
+    assert secret not in blob
+    assert audit.REDACTED_SECRET in blob
+
+
+def test_audit_permissions_are_private(audit_cfg, tmp_path: Path):
+    cwd = tmp_path / "proj"
+    cwd.mkdir()
+    audit_cfg.audit_dir.mkdir(mode=0o755)
+    runner.run(
+        {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": "git status"},
+            "cwd": str(cwd),
+        },
+        adapter=get("claude"),
+        config=audit_cfg,
+    )
+    log = next(audit_cfg.audit_dir.glob("audit-*.jsonl"))
+    assert stat.S_IMODE(audit_cfg.audit_dir.stat().st_mode) == 0o700
+    assert stat.S_IMODE(log.stat().st_mode) == 0o600
+
+
+def test_audit_records_config_load_error(audit_cfg, tmp_path: Path):
+    cwd = tmp_path / "proj"
+    cwd.mkdir()
+    cfg = replace(
+        audit_cfg,
+        load_error="config_parse_error",
+    )
+    runner.run(
+        {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": "git status"},
+            "cwd": str(cwd),
+        },
+        adapter=get("claude"),
+        config=cfg,
+    )
+    record = _read_all(cfg.audit_dir)[0]
+    assert record["config_load_error"] == "config_parse_error"
 
 
 def test_no_audit_env_skips_write(audit_cfg, tmp_path: Path, monkeypatch):

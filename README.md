@@ -4,7 +4,7 @@
 
 它不是 OS sandbox，也不替代人工审查。目标是把「误删家目录 / force-push main / 管道执行远端脚本 / 改掉 hook 自身」等高代价失误，在 Hook 层挡下来或强制二次确认。
 
-当前内置 **Claude Code**、**Codex** 与 **Grok** 适配器，**37** 条规则、同一套引擎。
+当前内置 **Claude Code**、**Codex** 与 **Grok** 适配器，**38** 条规则、同一套引擎。
 
 ## 它做什么
 
@@ -22,6 +22,7 @@
 - **环境颠覆**：`PATH=` / `LD_PRELOAD=` / `BASH_ENV=` 前缀赋值
 - **越界读写**：CWD 外路径（含 `read_file` / `Read` / `grep`）；`~/.claude` / `~/.agents` 等指令区写入需确认
 - **整文件覆盖 / 删格**：`Write` 覆盖已有文件、`NotebookEdit delete`、`apply_patch` 删除
+- **外部上传**：拒绝 Chrome DevTools MCP 把本机文件上传到无法由本地规则验证的页面
 - **自保**：拒绝改写 safety-guard 入口、包目录及配置中的 `critical_paths`
 - **不可解释即标记**：路径槽静态算不清、内联/占位脚本运行时才成形 → ask，不静默放行
 - **包装不降级**：`rtk rm -rf /`、`sudo env FOO=1 rm …` 与裸命令同级拦截
@@ -32,7 +33,7 @@
 平台 Hook JSON → Adapter.parse → Operation(s) → Engine + 规则 → Decision → Adapter.render → 平台 JSON
 ```
 
-平台协议只活在 Adapter 里；规则只吃规范化 `Context`。Codex 的一次 `apply_patch` 会拆成多个 `Write`/`Edit` Operation，由同一引擎聚合决策。
+平台协议只活在 Adapter 里；规则只吃规范化 `Context`。Codex 的一次 `apply_patch` 或带多个本机路径的 MCP 调用会拆成多个 Operation，由同一引擎聚合决策。
 
 更完整的架构、扩展 Adapter/规则、规则全表见 **[GUIDE.md](./GUIDE.md)**。
 
@@ -41,7 +42,7 @@
 | Adapter | 事件 | 工具 |
 | --- | --- | --- |
 | `claude`（默认） | Claude Code `PreToolUse` | `Bash` / `Write` / `Edit` / `NotebookEdit` / `Read` / `Grep` / `Glob` |
-| `codex-pretool` | Codex `PreToolUse` | `Bash`/`shell`、`apply_patch` |
+| `codex-pretool` | Codex `PreToolUse` | `Bash`/`shell`、`apply_patch`、`Edit`、`Write`、当前 Chrome DevTools MCP 本机路径工具 |
 | `codex-permission` | Codex `PermissionRequest` | 同上 |
 | `grok` | Grok `pre_tool_use` / `PreToolUse` | `run_terminal_command`、`write`、`search_replace`、`read_file`、`list_dir`、`grep`（及 Bash/Write/Edit/Read 别名） |
 
@@ -98,14 +99,29 @@ safety-guard/
 
 ### 接入 Codex
 
-PreToolUse / PermissionRequest 分别指定 adapter：
+在用户级 `~/.codex/config.toml` 中为两个事件分别注册命令，并显式指定对应 Adapter：
 
-```bash
-python3 /path/to/safety-guard/safety-guard.py --adapter codex-pretool
-python3 /path/to/safety-guard/safety-guard.py --adapter codex-permission
+```toml
+[[hooks.PreToolUse]]
+matcher = "^(Bash|apply_patch|Edit|Write|mcp__chrome_devtools__(evaluate_script|get_network_request|lighthouse_audit|performance_start_trace|performance_stop_trace|take_heapsnapshot|take_screenshot|take_snapshot|upload_file))$"
+hooks = [
+  { type = "command", command = "python3 /path/to/safety-guard/safety-guard.py --adapter codex-pretool" },
+]
+
+[[hooks.PermissionRequest]]
+matcher = "^(Bash|apply_patch|Edit|Write|mcp__chrome_devtools__(evaluate_script|get_network_request|lighthouse_audit|performance_start_trace|performance_stop_trace|take_heapsnapshot|take_screenshot|take_snapshot|upload_file))$"
+hooks = [
+  { type = "command", command = "python3 /path/to/safety-guard/safety-guard.py --adapter codex-permission" },
+]
 ```
 
-（具体挂载字段以你使用的 Codex Hook 配置为准；stdin 需为平台原生 JSON。）
+不要用全局 `SAFETY_GUARD_ADAPTER` 替代命令行参数；两个 Hook 的事件协议不同，显式参数不会影响 Claude 或 Grok Adapter。
+
+Chrome DevTools MCP 的普通浏览器操作不涉及本机路径，不进入当前 matcher；截图、trace、network body 等显式输出路径复用文件写入规则；`upload_file` 会因外部数据传输被拒绝。Adapter 直接收到未知工具时使用空 Operation 放行，并保留归一化审计入口，供以后接入独立的未知行为检测方案。
+
+matcher 不使用 `mcp__chrome_devtools__.*` 通配符。使用 `chrome-devtools-mcp@latest` 出现新工具时，未知工具保持平台默认行为；确认其 schema 包含本机路径后，再同时扩展 Adapter 与 matcher。
+
+修改 Hook 定义后，在 Codex 中运行 `/hooks` 并重新信任变更；不要手动修改 `[hooks.state]` 的信任哈希。
 
 ### 接入 Grok
 
@@ -152,6 +168,8 @@ python3 safety-guard.py --explain --tool Write --path ./README.md
 | `fail_open` / `dry_run` | 异常放行 / 只审计不拦截 |
 | `audit_*` | 审计目录与保留策略 |
 
+配置读取或解析失败时，会回退到 fail-closed 默认值，仍保护 Claude、Codex、Grok 的控制文件；审计只记录 `config_load_error` 类型，不记录底层异常详情。
+
 环境变量（优先级高于 TOML）：
 
 | 变量 | 作用 |
@@ -163,7 +181,7 @@ python3 safety-guard.py --explain --tool Write --path ./README.md
 | `SAFETY_GUARD_NO_AUDIT=1` | 不写审计（测试/回放） |
 | `SAFETY_GUARD_IGNORE_DISABLED_RULES=1` | 忽略 `disabled_rules` |
 
-审计默认写在安装目录下 `audit/audit-YYYY-MM-DD.jsonl`，含命令预览与决策，**上传仓库前请勿提交真实审计**（含本机路径与历史命令）。
+审计默认写在安装目录下 `audit/audit-YYYY-MM-DD.jsonl`，目录权限为 `0700`、日志文件权限为 `0600`。常见 API key、token、密码赋值、认证头和 JSON 凭据字段会脱敏，但这只是补救措施，不应把真实凭据传给工具命令；**上传仓库前请勿提交真实审计**（含本机路径与历史命令）。
 
 ## 调试与回归
 

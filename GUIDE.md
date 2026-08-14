@@ -46,7 +46,7 @@ Adapter.render()
 ```
 
 Adapter 负责协议翻译，Engine 只处理统一数据结构。一个平台调用可以生成一个或多个
-`Operation`，因此 Codex `apply_patch` 多文件操作无需 Engine 维护特殊分支。
+`Operation`，因此 Codex `apply_patch` 或多路径 MCP 调用无需 Engine 维护特殊分支。
 
 入口：
 
@@ -68,14 +68,14 @@ safety_guard/
 ├── adapters/
 │   ├── base.py          # Adapter Protocol
 │   ├── claude.py
-│   ├── codex.py         # PreToolUse + PermissionRequest + apply_patch 解析
+│   ├── codex.py         # PreToolUse + PermissionRequest + apply_patch/MCP 解析
 │   ├── grok.py          # Grok pre_tool_use / 顶层 decision
 │   ├── fields.py        # tool_input / cwd 字段别名
 │   └── registry.py
 ├── rules/
 │   ├── base.py
 │   ├── registry.py      # 按模块名字典序显式 import 并 @register
-│   └── <rule>.py        # 当前 37 条
+│   └── <rule>.py        # 当前 38 条
 ├── contracts.py         # Operation / NormalizedRequest / DecisionResult
 ├── runner.py            # stdin ↔ Adapter ↔ Engine
 ├── engine.py            # 聚合决策 + 审计
@@ -113,7 +113,7 @@ tests/
 | `helpers.py` | 规则侧共用遍历与判定 |
 | `rules/base.py` | 定义 Rule 和 RuleMatch |
 | `rules/registry.py` | 显式加载并注册规则 |
-| `audit.py` | 按日 jsonl + 轮转清理 |
+| `audit.py` | 按日私有 jsonl、凭据脱敏与轮转清理 |
 | `cli.py` | `--list-rules` / `--explain` / `--selftest` / `--regression` |
 | `tools/replay.py` | 用真实 audit 建基线、改规则前后对比 |
 
@@ -206,7 +206,7 @@ command
 - **stdin 拉码**：`bash -s < <(curl…)` / `zsh <(curl…)` / `source /dev/stdin <<< "$(curl…)"` → `bash-remote-stdin-exec`（high）；无网络字面时归 opaque。
 - **`-c` 混淆**：`$'-c'` 等 ANSI-C 选项经 source 切片 + expand 后再识别；`env -S '…'` 字面载荷再 shlex 拆词。
 - **outside 脚本执行**：`bash /out/x.sh`、`python3 /out/x.py` → `bash-outside-script-exec`。
-- **审计/理由脱敏**：`redact_user_paths` 把真实家目录打成 `$HOME`，避免 jsonl/确认框泄漏用户名路径。
+- **审计/理由脱敏**：家目录显示为 `$HOME`；常见 API key、token、密码和认证头在 jsonl 中替换为 `<redacted>`。
 - **busybox/toybox 多调用**：`unwrap` 后剥成真实 applet（`busybox cat` → `cat`）；`xargs -a FILE` 继承读源。
 - **折叠失败诚实**：算不出的 word `folded=None`，由 `bash-unresolvable-path` 等规则消费，不退回原文假装安全。
 - **路径分类**：`in-cwd` / `instruction-zone` / `outside`；CWD 内 symlink 按链接位置算 in-cwd。
@@ -219,7 +219,7 @@ command
 | Adapter 名 | 平台事件 | 输入工具 |
 | --- | --- | --- |
 | `claude` | Claude Code `PreToolUse` | `Bash` / `Write` / `Edit` / `NotebookEdit` / `Read` / `Grep` / `Glob` |
-| `codex-pretool` | Codex `PreToolUse` | `Bash`/`shell` + `apply_patch` |
+| `codex-pretool` | Codex `PreToolUse` | `Bash`/`shell`、`apply_patch`、`Edit`/`Write`、已建模的 Chrome DevTools MCP 路径工具 |
 | `codex-permission` | Codex `PermissionRequest` | 同上 |
 | `grok` | Grok `pre_tool_use` / `PreToolUse` | `run_terminal_command` / `write` / `search_replace` / `read_file` / `list_dir` / `grep`（及 Bash/Write/Edit/Read 别名） |
 
@@ -271,6 +271,17 @@ python3 safety-guard.py --adapter grok
 
 `file-patch-delete` 仅在 `patch_action=delete` 时 ask。
 
+### Codex MCP 与未知工具
+
+当前 Chrome DevTools MCP 中，9 个读取或写入本机路径的工具会转换为
+`Read` / `Write` / `Edit` Operation；其余 20 个无本机路径工具显式识别但不进入
+用户级 matcher。`upload_file` 额外标记为外部上传并由 high 规则拒绝。
+
+matcher 只列已建模工具，不使用 `mcp__chrome_devtools__.*`。未知工具直接收到时
+生成空 Operation 放行，同时保留独立归一化入口；未来应在确认新工具 schema 后，
+同时扩展 Adapter、matcher 和测试。已建模工具的路径字段或 `tool_input` 畸形仍
+fail-closed。
+
 ## 审计字段（优化拦截）
 
 每次真实 Hook（未设 `SAFETY_GUARD_NO_AUDIT`）在 **render 之后** 写一行 jsonl：
@@ -286,8 +297,10 @@ python3 safety-guard.py --adapter grok
 | `cmd_preview` | 预览（保留换行；超长截断到 4096+…） |
 | `hook_event` | 规范化事件名 |
 | `matches` | 命中规则 id/severity/reason/extra |
+| `config_load_error` | 配置读取、解析或校验失败的类型（不含底层异常详情） |
 
 `tools/replay.py` 优先用 `cmd_body`，并与 `engine_decision` 对比。
+审计目录固定为 `0700`，日志文件固定为 `0600`。
 
 ## 接入新平台
 
@@ -398,7 +411,7 @@ class ExampleRule(Rule):
 `ctx.classify()`；文件工具用 `ctx.target_path` / `ctx.classification` /
 `ctx.file_exists` / `ctx.patch_action`。共用逻辑放 `helpers.py`，不要在规则里重解析命令。
 
-### 当前规则一览（37）
+### 当前规则一览（38）
 
 `python3 safety-guard.py --list-rules` 可打印完整描述。
 
@@ -417,6 +430,7 @@ class ExampleRule(Rule):
 | `bash-rm-root-or-home` | Bash | `rm` 目标为 `/` 或 `$HOME` |
 | `bash-sql-drop-database` | Bash | `DROP DATABASE` / `DROP SCHEMA` |
 | `file-critical-path-write` | Write/Edit/NotebookEdit | 写入 critical_paths |
+| `file-external-upload` | Read | 把本机文件上传到本地规则无法验证的外部页面 |
 | `bash-interpreter-write` | Bash | 解释器 -c/-e 写/删 critical_paths |
 
 ### medium → ask
@@ -483,7 +497,8 @@ SAFETY_GUARD_FAIL_OPEN=1 python3 safety-guard.py --adapter codex-pretool
 2. 安装根目录下的 `safety_guard.toml`
 
 `load()` 永不抛：解析失败回退最小安全默认值，避免包损坏后无法再编辑自愈。
-`critical_paths` 用户配置与默认**合并**（默认始终保护入口脚本 + `safety_guard/` 包目录）。
+`critical_paths` 用户配置与默认**合并**（默认始终保护入口脚本、`safety_guard/`
+包目录，以及 Claude、Codex、Grok 的用户级控制文件）。
 
 常用 TOML 字段：
 
@@ -549,7 +564,7 @@ SAFETY_GUARD_IGNORE_DISABLED_RULES=1 python3 safety-guard.py --regression
 关键测试应覆盖：
 
 - 每个 Adapter 的输入解析和输出渲染。
-- 未知工具和非法输入的 fail-closed 行为。
+- 各 Adapter 的未知工具策略，以及已建模工具非法输入的 fail-closed 行为。
 - 多 Operation 聚合（含 apply_patch）。
 - 真实 stdin 入口。
 - 规则注册和禁用规则。

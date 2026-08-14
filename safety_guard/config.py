@@ -12,8 +12,9 @@ from __future__ import annotations
 
 import os
 import tomllib
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
+from typing import Literal
 
 from . import bash_ast as _bash_ast
 from .bash_ast import WrapperSpec
@@ -21,6 +22,7 @@ from .bash_ast import WrapperSpec
 
 _FAIL_OPEN_ENV = "SAFETY_GUARD_FAIL_OPEN"
 _DRY_RUN_ENV = "SAFETY_GUARD_DRY_RUN"
+ConfigLoadError = Literal["config_read_error", "config_parse_error", "config_invalid"]
 
 
 def _install_root() -> Path:
@@ -36,6 +38,17 @@ def _package_dir() -> Path:
 def _entry_script() -> Path:
     """入口脚本路径（命名固定为 safety-guard.py）。"""
     return _install_root() / "safety-guard.py"
+
+
+def _platform_critical_paths() -> list[str]:
+    home = Path.home()
+    return [
+        str(home / ".claude" / "settings.json"),
+        str(home / ".codex" / "config.toml"),
+        str(home / ".codex" / "hooks.json"),
+        str(home / ".grok" / "config.toml"),
+        str(home / ".grok" / "hooks"),
+    ]
 
 
 def _find_config_path() -> Path | None:
@@ -71,14 +84,10 @@ def _defaults() -> dict:
         # 不剥的话 `rtk rm -rf /` / `sudo rm -rf /` 会绕过全部按命令名匹配的规则。
         "wrapper_commands": list(_bash_ast.DEFAULT_WRAPPERS),
         "wrapper_specs": {},
-        # 默认只自保护——把 hook 自身和入口脚本列入。CLI 特定的路径（如 ~/.claude/settings.json）
-        # 由各 CLI 的 safety_guard.toml 自行追加。
         "critical_paths": [
             str(_entry_script()),
             str(_package_dir()),
-            # Grok CLI 配置与 hook 定义：被改掉等于卸防护
-            str(Path.home() / ".grok" / "config.toml"),
-            str(Path.home() / ".grok" / "hooks"),
+            *_platform_critical_paths(),
         ],
         "fail_open": False,
         "dry_run": False,
@@ -104,6 +113,7 @@ class Config:
     audit_retention_days: int
     audit_max_file_mb: int
     audit_max_total_mb: int
+    load_error: ConfigLoadError | None = None
     # 带默认值，保证 load() 未显式传入时也能构造（避免改配置时把 hook 锁死）
     wrapper_commands: frozenset[str] = frozenset(_bash_ast.DEFAULT_WRAPPERS)
     wrapper_specs: dict[str, WrapperSpec] = field(default_factory=lambda: dict(_bash_ast.DEFAULT_WRAPPER_SPECS))
@@ -127,7 +137,10 @@ def _minimal_config() -> Config:
         protected_branches=("main", "master", "release/*"),
         read_only_zones=(Path.home() / ".claude", Path.home() / ".agents", Path.home() / ".codex", Path.home() / ".grok"),
         read_only_commands=frozenset({"cat", "rg", "grep", "find", "ls", "head", "tail", "wc", "stat", "file", "sed", "awk"}),
-        critical_paths=(root / "safety-guard.py", root / "safety_guard"),
+        critical_paths=tuple(
+            [root / "safety-guard.py", root / "safety_guard"]
+            + [Path(path) for path in _platform_critical_paths()]
+        ),
         fail_open=False,
         dry_run=False,
         audit_dir=root / "audit",
@@ -144,11 +157,15 @@ def load(path: Path | None = None) -> Config:
         return _load(path)
     except Exception:
         # 兜底而不是抛——见 _minimal_config 的说明
-        return _minimal_config()
+        return replace(
+            _minimal_config(),
+            load_error="config_invalid",
+        )
 
 
 def _load(path: Path | None = None) -> Config:
     raw: dict = _defaults()
+    load_error: ConfigLoadError | None = None
     cfg_path = path if path is not None else _find_config_path()
     if cfg_path is not None and cfg_path.exists():
         try:
@@ -162,9 +179,10 @@ def _load(path: Path | None = None) -> Config:
             raw.update(user)
             if isinstance(user_wrapper_specs, dict):
                 raw["wrapper_specs"] = user_wrapper_specs
-        except (OSError, tomllib.TOMLDecodeError):
-            # 解析失败用默认值；engine 层有 fail-closed 兜底
-            pass
+        except OSError:
+            load_error = "config_read_error"
+        except tomllib.TOMLDecodeError:
+            load_error = "config_parse_error"
 
     if os.environ.get(_FAIL_OPEN_ENV) == "1":
         raw["fail_open"] = True
@@ -188,6 +206,7 @@ def _load(path: Path | None = None) -> Config:
         audit_retention_days=int(raw["audit_retention_days"]),
         audit_max_file_mb=int(raw["audit_max_file_mb"]),
         audit_max_total_mb=int(raw["audit_max_total_mb"]),
+        load_error=load_error,
         wrapper_commands=_wrapper_command_names(raw),
         wrapper_specs=_bash_ast.merge_wrapper_specs(raw.get("wrapper_specs")),
     )

@@ -23,6 +23,7 @@ import datetime as _dt
 import hashlib
 import json
 import os
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -39,6 +40,43 @@ FULL_BODY_CHARS = 8192
 # 截断预览长度（保留换行，不再压成单行）
 PREVIEW_CHARS = 4096
 TRUNCATION_SUFFIX = "…"
+REDACTED_SECRET = "<redacted>"
+_AUDIT_DIR_MODE = 0o700
+_AUDIT_FILE_MODE = 0o600
+
+_SENSITIVE_NAME = (
+    r"(?:(?:[A-Za-z][A-Za-z0-9]*[_-])*(?:api[_-]?key|access[_-]?(?:token|key)|"
+    r"auth[_-]?token|bearer[_-]?token|client[_-]?secret|password|passwd|pwd|"
+    r"private[_-]?key|secret|token|authorization|credential))"
+)
+_ASSIGNMENT_SECRET_RE = re.compile(
+    rf"(?i)(?P<prefix>\b{_SENSITIVE_NAME}\b\s*=\s*)"
+    r"(?P<quote>['\"]?)(?P<value>[^\s'\";|&]+)(?P=quote)"
+)
+_OPTION_SECRET_RE = re.compile(
+    rf"(?i)(?P<prefix>--{_SENSITIVE_NAME}(?:=|\s+))"
+    r"(?P<quote>['\"]?)(?P<value>[^\s'\";|&]+)(?P=quote)"
+)
+_QUOTED_ASSIGNMENT_SECRET_RE = re.compile(
+    rf"(?i)(?P<prefix>\b{_SENSITIVE_NAME}\b\s*=\s*)"
+    r"(?P<quote>['\"])(?P<value>(?:\\.|[^'\"\\])*)(?P=quote)"
+)
+_QUOTED_OPTION_SECRET_RE = re.compile(
+    rf"(?i)(?P<prefix>--{_SENSITIVE_NAME}(?:=|\s+))"
+    r"(?P<quote>['\"])(?P<value>(?:\\.|[^'\"\\])*)(?P=quote)"
+)
+_AUTH_HEADER_RE = re.compile(
+    r"(?i)(?P<prefix>\b(?:authorization|proxy-authorization)\s*:\s*)"
+    r"(?P<scheme>bearer|basic)\s+(?P<value>[^\s'\"]+)"
+)
+_JSON_DOUBLE_QUOTED_SECRET_RE = re.compile(
+    rf'(?i)(?P<prefix>"{_SENSITIVE_NAME}"\s*:\s*")'
+    r'(?P<value>(?:\\.|[^"\\])*)(?P<suffix>")'
+)
+_JSON_SINGLE_QUOTED_SECRET_RE = re.compile(
+    rf"(?i)(?P<prefix>'{_SENSITIVE_NAME}'\s*:\s*')"
+    r"(?P<value>(?:\\.|[^'\\])*)(?P<suffix>')"
+)
 
 
 def disabled() -> bool:
@@ -114,9 +152,50 @@ def _digest(cmd: str) -> str:
     return "sha256:" + hashlib.sha256(cmd.encode("utf-8", errors="replace")).hexdigest()[:16]
 
 
+def _redact_secrets(text: str) -> str:
+    def replace_assignment(match: re.Match[str]) -> str:
+        quote = match.group("quote") or ""
+        return f"{match.group('prefix')}{quote}{REDACTED_SECRET}{quote}"
+
+    def replace_quoted_secret(match: re.Match[str]) -> str:
+        return f"{match.group('prefix')}{REDACTED_SECRET}{match.group('suffix')}"
+
+    redacted = _JSON_DOUBLE_QUOTED_SECRET_RE.sub(replace_quoted_secret, text)
+    redacted = _JSON_SINGLE_QUOTED_SECRET_RE.sub(replace_quoted_secret, redacted)
+    redacted = _QUOTED_ASSIGNMENT_SECRET_RE.sub(replace_assignment, redacted)
+    redacted = _QUOTED_OPTION_SECRET_RE.sub(replace_assignment, redacted)
+    redacted = _ASSIGNMENT_SECRET_RE.sub(replace_assignment, redacted)
+    redacted = _OPTION_SECRET_RE.sub(replace_assignment, redacted)
+    return _AUTH_HEADER_RE.sub(
+        lambda match: f"{match.group('prefix')}{match.group('scheme')} {REDACTED_SECRET}",
+        redacted,
+    )
+
+
 def _redact(text: str) -> str:
     from .helpers import redact_user_paths
-    return redact_user_paths(text or "")
+    return _redact_secrets(redact_user_paths(text or ""))
+
+
+def _ensure_private_dir(path: Path) -> bool:
+    try:
+        path.mkdir(mode=_AUDIT_DIR_MODE, parents=True, exist_ok=True)
+        path.chmod(_AUDIT_DIR_MODE)
+    except OSError:
+        return False
+    return True
+
+
+def _append_private(path: Path, line: str) -> None:
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, _AUDIT_FILE_MODE)
+    try:
+        os.fchmod(fd, _AUDIT_FILE_MODE)
+        with os.fdopen(fd, "a", encoding="utf-8") as handle:
+            fd = -1
+            handle.write(line)
+    finally:
+        if fd >= 0:
+            os.close(fd)
 
 
 def _cmd_fields(raw_input: str) -> dict[str, Any]:
@@ -212,9 +291,7 @@ def write(
         return
     cfg = config or _cfg.load()
     audit_dir = cfg.audit_dir
-    try:
-        audit_dir.mkdir(parents=True, exist_ok=True)
-    except OSError:
+    if not _ensure_private_dir(audit_dir):
         return
 
     _maybe_prune(audit_dir, cfg)
@@ -240,6 +317,8 @@ def write(
         "engine_decision": eng,
         "rendered_decision": rendered,
     }
+    if cfg.load_error:
+        record["config_load_error"] = cfg.load_error
     if hook_event:
         record["hook_event"] = hook_event
     if is_dry:
@@ -252,8 +331,7 @@ def write(
     line = json.dumps(record, ensure_ascii=False) + "\n"
     target = _today_path(audit_dir, cfg)
     try:
-        with target.open("a", encoding="utf-8") as f:
-            f.write(line)
+        _append_private(target, line)
     except OSError:
         return
 
