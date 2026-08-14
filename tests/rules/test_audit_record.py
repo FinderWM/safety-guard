@@ -1,9 +1,10 @@
-"""审计落盘字段：完整正文、双决策、adapter 必填。"""
+"""审计落盘字段：默认元数据、正文 opt-in、双决策与 adapter。"""
 from __future__ import annotations
 
 import json
 import os
 import stat
+from datetime import date
 from dataclasses import replace
 from pathlib import Path
 
@@ -21,6 +22,11 @@ def audit_cfg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     return cfg
 
 
+@pytest.fixture
+def audit_body_cfg(audit_cfg):
+    return replace(audit_cfg, audit_include_body=True)
+
+
 def _read_all(audit_dir: Path) -> list[dict]:
     files = sorted(audit_dir.glob("audit-*.jsonl"))
     out: list[dict] = []
@@ -31,7 +37,7 @@ def _read_all(audit_dir: Path) -> list[dict]:
     return out
 
 
-def test_grok_medium_records_engine_ask_rendered_deny(audit_cfg, tmp_path: Path):
+def test_grok_medium_records_engine_ask_rendered_allow(audit_cfg, tmp_path: Path):
     cwd = tmp_path / "proj"
     cwd.mkdir()
     out = runner.run(
@@ -44,22 +50,24 @@ def test_grok_medium_records_engine_ask_rendered_deny(audit_cfg, tmp_path: Path)
         adapter=get("grok"),
         config=audit_cfg,
     )
-    assert out["decision"] == "deny"
+    assert out == {}
     rows = _read_all(audit_cfg.audit_dir)
     assert len(rows) == 1
     rec = rows[0]
     assert rec["adapter"] == "grok"
     assert rec["engine_decision"] == "ask"
-    assert rec["rendered_decision"] == "deny"
+    assert rec["rendered_decision"] == "allow"
     assert rec["decision"] == "ask"  # 兼容字段 = 引擎结论
     assert rec["hook_event"] == "PreToolUse"
-    assert rec.get("cmd_truncated") is False
-    assert "rm -rf ./tmp-dir" in (rec.get("cmd_body") or "")
-    assert rec["cmd_body"] == rec["cmd_preview"]
+    assert rec["cmd_body_stored"] is False
+    assert rec["match_details_stored"] is False
+    assert "cmd_body" not in rec
+    assert "cmd_preview" not in rec
+    assert rec["matches"] == [{"id": "bash-rm-targeted", "severity": "medium"}]
     assert "harness" not in rec
 
 
-def test_claude_allow_empty_render_is_allow(audit_cfg, tmp_path: Path):
+def test_claude_allow_empty_render_is_abstain(audit_cfg, tmp_path: Path):
     cwd = tmp_path / "proj"
     cwd.mkdir()
     out = runner.run(
@@ -76,11 +84,32 @@ def test_claude_allow_empty_render_is_allow(audit_cfg, tmp_path: Path):
     rec = _read_all(audit_cfg.audit_dir)[0]
     assert rec["adapter"] == "claude"
     assert rec["engine_decision"] == "allow"
-    assert rec["rendered_decision"] == "allow"
+    assert rec["rendered_decision"] == "abstain"
     assert rec["decision"] == "allow"
 
 
-def test_full_body_preserves_newlines(audit_cfg, tmp_path: Path):
+def test_codex_permission_dry_run_records_native_abstain(audit_cfg, tmp_path: Path):
+    cfg = replace(audit_cfg, dry_run=True)
+    cwd = tmp_path / "proj"
+    cwd.mkdir()
+    output = runner.run(
+        {
+            "hook_event_name": "PermissionRequest",
+            "tool_name": "Bash",
+            "tool_input": {"command": "git status"},
+            "cwd": str(cwd),
+        },
+        adapter=get("codex-permission"),
+        config=cfg,
+    )
+
+    assert output == {}
+    record = _read_all(cfg.audit_dir)[0]
+    assert record["decision"] == "dry-run-allow"
+    assert record["rendered_decision"] == "abstain"
+
+
+def test_full_body_preserves_newlines(audit_body_cfg, tmp_path: Path):
     cwd = tmp_path / "proj"
     cwd.mkdir()
     cmd = "echo one\necho two\ngit status"
@@ -92,15 +121,15 @@ def test_full_body_preserves_newlines(audit_cfg, tmp_path: Path):
             "cwd": str(cwd),
         },
         adapter=get("claude"),
-        config=audit_cfg,
+        config=audit_body_cfg,
     )
-    rec = _read_all(audit_cfg.audit_dir)[0]
+    rec = _read_all(audit_body_cfg.audit_dir)[0]
     assert rec["cmd_body"] == cmd
     assert "\n" in rec["cmd_body"]
     assert rec["cmd_lines"] == 3
 
 
-def test_long_command_truncated_without_body(audit_cfg, tmp_path: Path, monkeypatch):
+def test_long_command_truncated_without_body(audit_body_cfg, tmp_path: Path, monkeypatch):
     cwd = tmp_path / "proj"
     cwd.mkdir()
     # 压低阈值，避免写超大字符串
@@ -115,16 +144,16 @@ def test_long_command_truncated_without_body(audit_cfg, tmp_path: Path, monkeypa
             "cwd": str(cwd),
         },
         adapter=get("claude"),
-        config=audit_cfg,
+        config=audit_body_cfg,
     )
-    rec = _read_all(audit_cfg.audit_dir)[0]
+    rec = _read_all(audit_body_cfg.audit_dir)[0]
     assert rec["cmd_truncated"] is True
     assert "cmd_body" not in rec
     assert rec["cmd_preview"].endswith(audit.TRUNCATION_SUFFIX)
     assert rec["cmd_chars"] == len(cmd)
 
 
-def test_match_extra_redacts_home(audit_cfg, tmp_path: Path):
+def test_match_extra_redacts_home(audit_body_cfg, tmp_path: Path):
     cwd = tmp_path / "proj"
     cwd.mkdir()
     home = str(Path.home())
@@ -137,15 +166,15 @@ def test_match_extra_redacts_home(audit_cfg, tmp_path: Path):
             "cwd": str(cwd),
         },
         adapter=get("claude"),
-        config=audit_cfg,
+        config=audit_body_cfg,
     )
-    rec = _read_all(audit_cfg.audit_dir)[0]
+    rec = _read_all(audit_body_cfg.audit_dir)[0]
     blob = json.dumps(rec.get("matches") or [], ensure_ascii=False)
     assert home not in blob
     assert "$HOME" in blob
 
 
-def test_home_path_redacted_in_body(audit_cfg, tmp_path: Path):
+def test_home_path_redacted_in_body(audit_body_cfg, tmp_path: Path):
     cwd = tmp_path / "proj"
     cwd.mkdir()
     home = str(Path.home())
@@ -158,9 +187,9 @@ def test_home_path_redacted_in_body(audit_cfg, tmp_path: Path):
             "cwd": str(cwd),
         },
         adapter=get("claude"),
-        config=audit_cfg,
+        config=audit_body_cfg,
     )
-    rec = _read_all(audit_cfg.audit_dir)[0]
+    rec = _read_all(audit_body_cfg.audit_dir)[0]
     body = rec.get("cmd_body") or ""
     assert home not in body
     assert "$HOME" in body
@@ -181,7 +210,7 @@ def test_home_path_redacted_in_body(audit_cfg, tmp_path: Path):
     ],
 )
 def test_credentials_are_redacted_from_audit_body(
-    audit_cfg,
+    audit_body_cfg,
     tmp_path: Path,
     command: str,
     secret: str,
@@ -196,9 +225,9 @@ def test_credentials_are_redacted_from_audit_body(
             "cwd": str(cwd),
         },
         adapter=get("claude"),
-        config=audit_cfg,
+        config=audit_body_cfg,
     )
-    blob = json.dumps(_read_all(audit_cfg.audit_dir)[0], ensure_ascii=False)
+    blob = json.dumps(_read_all(audit_body_cfg.audit_dir)[0], ensure_ascii=False)
     assert secret not in blob
     assert audit.REDACTED_SECRET in blob
 
@@ -222,6 +251,56 @@ def test_audit_permissions_are_private(audit_cfg, tmp_path: Path):
     assert stat.S_IMODE(log.stat().st_mode) == 0o600
 
 
+@pytest.mark.parametrize("link_kind", ["symlink", "hardlink"])
+def test_audit_refuses_linked_log_target_without_touching_target(
+    audit_cfg,
+    tmp_path: Path,
+    link_kind: str,
+):
+    """审计文件不能借链接跟随写入仓库外的合成目标。"""
+    target = tmp_path / "synthetic-target.txt"
+    target.write_text("sentinel", encoding="utf-8")
+    audit_cfg.audit_dir.mkdir()
+    log = audit_cfg.audit_dir / f"audit-{date.today().isoformat()}.jsonl"
+    if link_kind == "symlink":
+        log.symlink_to(target)
+    else:
+        os.link(target, log)
+
+    runner.run(
+        {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": "git status"},
+            "cwd": str(tmp_path / "proj"),
+        },
+        adapter=get("claude"),
+        config=audit_cfg,
+    )
+
+    assert target.read_text(encoding="utf-8") == "sentinel"
+    assert log.is_symlink() or log.stat().st_nlink == 2
+
+
+def test_audit_refuses_symlinked_directory_without_creating_files(audit_cfg, tmp_path: Path):
+    target_dir = tmp_path / "synthetic-audit-target"
+    target_dir.mkdir()
+    audit_cfg.audit_dir.symlink_to(target_dir, target_is_directory=True)
+
+    runner.run(
+        {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": "git status"},
+            "cwd": str(tmp_path / "proj"),
+        },
+        adapter=get("claude"),
+        config=audit_cfg,
+    )
+
+    assert list(target_dir.iterdir()) == []
+
+
 def test_audit_records_config_load_error(audit_cfg, tmp_path: Path):
     cwd = tmp_path / "proj"
     cwd.mkdir()
@@ -243,6 +322,39 @@ def test_audit_records_config_load_error(audit_cfg, tmp_path: Path):
     assert record["config_load_error"] == "config_parse_error"
 
 
+def test_parse_failure_audit_hashes_untrusted_labels(audit_cfg, tmp_path: Path):
+    class RejectingAdapter:
+        name = "synthetic-rejecting"
+
+        @staticmethod
+        def parse(stdin_json):
+            raise ValueError("synthetic parse failure")
+
+        @staticmethod
+        def render(result):
+            return {"decision": "deny"}
+
+    tool_secret = "FutureTool\nsynthetic-tool-label-secret"
+    event_secret = "PreToolUse\nsynthetic-event-label-secret"
+    runner.run(
+        {
+            "hook_event_name": event_secret,
+            "tool_name": tool_secret,
+            "tool_input": {},
+            "cwd": str(tmp_path),
+        },
+        adapter=RejectingAdapter(),
+        config=audit_cfg,
+    )
+
+    record = _read_all(audit_cfg.audit_dir)[0]
+    blob = json.dumps(record, ensure_ascii=False)
+    assert record["tool"].startswith("unknown:")
+    assert record["hook_event"].startswith("unknown:")
+    assert "synthetic-tool-label-secret" not in blob
+    assert "synthetic-event-label-secret" not in blob
+
+
 def test_no_audit_env_skips_write(audit_cfg, tmp_path: Path, monkeypatch):
     monkeypatch.setenv(audit.AUDIT_DISABLE_ENV, "1")
     cwd = tmp_path / "proj"
@@ -262,7 +374,24 @@ def test_no_audit_env_skips_write(audit_cfg, tmp_path: Path, monkeypatch):
 
 def test_infer_rendered_helpers():
     assert audit.infer_rendered_decision({}, engine_decision="allow") == "allow"
+    assert (
+        audit.infer_rendered_decision({}, engine_decision="allow", adapter="claude")
+        == "abstain"
+    )
+    assert (
+        audit.infer_rendered_decision(
+            {},
+            engine_decision="allow",
+            adapter="codex-permission",
+            hook_event="PermissionRequest",
+        )
+        == "abstain"
+    )
     assert audit.infer_rendered_decision({"decision": "deny"}, engine_decision="ask") == "deny"
+    assert (
+        audit.infer_rendered_decision({"unexpected": True}, engine_decision="abstain")
+        == "abstain"
+    )
     assert (
         audit.infer_rendered_decision(
             {"hookSpecificOutput": {"permissionDecision": "deny"}},

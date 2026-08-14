@@ -8,7 +8,7 @@ from .base import Rule, RuleMatch
 from .registry import register
 
 SQL_CLIENTS = frozenset({"psql", "mysql", "mysqlsh", "sqlite3", "mongo", "mongosh"})
-DROP_PATTERN = re.compile(r"\bdrop\s+(database|schema)\b", re.IGNORECASE)
+DROP_PATTERN = re.compile(r"\bdrop\s+(database|schema|table)\b", re.IGNORECASE)
 
 
 @register
@@ -26,14 +26,17 @@ class BashSqlDropDatabase(Rule):
                 continue
             # 所有参数和原文 raw 都扫一次
             text = cmd.raw
-            if DROP_PATTERN.search(text):
+            match = DROP_PATTERN.search(text)
+            if match:
+                object_type = match.group(1).lower()
+                severity = "high" if object_type in {"database", "schema"} else "medium"
                 return RuleMatch(
                     rule_id=self.id,
-                    severity=self.severity,
+                    severity=severity,
                     reason=(
-                        f"拒绝执行：`{ctx.raw_command}` 通过 {cmd.name} 执行 DROP DATABASE/SCHEMA，"
-                        f"将销毁整个库。"
+                        f"`{ctx.raw_command}` 通过 {cmd.name} 执行 DROP {object_type.upper()}，"
+                        + ("将销毁整个库，已拒绝。" if severity == "high" else "可能丢失表数据，请确认。")
                     ),
-                    extra={"client": cmd.name},
+                    extra={"client": cmd.name, "object": object_type},
                 )
         return None

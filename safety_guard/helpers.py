@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 import fnmatch
+import hashlib
+import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
@@ -47,6 +50,79 @@ def normalize_cmd_name(name: str) -> str:
     return base if base else name
 
 
+_SAFE_IDENTIFIER = re.compile(r"[A-Za-z0-9_.:_-]{1,160}")
+
+
+def safe_identifier(value: str | None) -> str:
+    """保留协议标识符；异常或含控制字符的值只暴露稳定摘要。"""
+    if isinstance(value, str) and _SAFE_IDENTIFIER.fullmatch(value):
+        return value
+    raw = value if isinstance(value, str) else ""
+    if not raw:
+        return "unknown"
+    digest = hashlib.sha256(raw.encode("utf-8", errors="replace")).hexdigest()[:16]
+    return f"unknown:{digest}"
+
+
+_GIT_GLOBAL_VALUE_OPTS = frozenset({
+    "-C", "-c", "--git-dir", "--work-tree", "--namespace",
+    "--super-prefix", "--config-env",
+})
+_GIT_TERMINAL_GLOBAL_OPTS = frozenset({"--help", "-h", "--version", "-v"})
+GIT_PUSH_VALUE_OPTIONS = frozenset({
+    "--exec",
+    "--push-option",
+    "--receive-pack",
+    "--recurse-submodules",
+    "--repo",
+    "-o",
+})
+
+
+def git_subcommand_args(args: list[str]) -> tuple[str | None, list[str]]:
+    """跳过 git 全局选项，返回真正的子命令及其参数。"""
+    index = 0
+    while index < len(args):
+        raw = args[index]
+        if raw in _GIT_TERMINAL_GLOBAL_OPTS:
+            return None, []
+        if raw in _GIT_GLOBAL_VALUE_OPTS:
+            index += 2
+            continue
+        if any(raw.startswith(option) and raw != option for option in ("-C", "-c")):
+            index += 1
+            continue
+        if raw.startswith("--") and "=" in raw:
+            index += 1
+            continue
+        if raw.startswith("-") and raw != "-":
+            index += 1
+            continue
+        return raw, args[index + 1 :]
+    return None, []
+
+
+def git_push_is_non_mutating(args: list[str]) -> bool:
+    """识别 push 的 dry-run/help，不把取值选项的值误当开关。"""
+    index = 0
+    while index < len(args):
+        raw = args[index]
+        if raw == "--":
+            return False
+        if raw in GIT_PUSH_VALUE_OPTIONS:
+            index += 2
+            continue
+        if raw.startswith("-o") and raw != "-o" and not raw.startswith("--"):
+            index += 1
+            continue
+        if raw in {"--dry-run", "--help", "-h"} or raw.startswith("--dry-run="):
+            return True
+        if raw.startswith("-") and not raw.startswith("--") and "n" in raw[1:]:
+            return True
+        index += 1
+    return False
+
+
 def redact_user_paths(text: str, home: str | None = None) -> str:
     """对外展示/审计前去掉真实家目录，避免 reason/audit 泄漏用户名路径。"""
     if not text:
@@ -56,10 +132,8 @@ def redact_user_paths(text: str, home: str | None = None) -> str:
         text = text.replace(h, "$HOME")
     # 常见绝对家目录形态（其它用户机器上的审计回放）
     if text.startswith("/Users/") or "/Users/" in text:
-        import re
         text = re.sub(r"/Users/[^/\s\"']+", "$HOME", text)
     if text.startswith("/home/") or "/home/" in text:
-        import re
         text = re.sub(r"/home/[^/\s\"']+", "$HOME", text)
     return text
 
@@ -76,19 +150,186 @@ def is_exec_interpreter_name(name: str) -> bool:
     return normalize_cmd_name(name) in EXEC_INTERPRETERS
 
 
+_SHELL_VALUE_OPTIONS = frozenset({"-C", "-O", "-o", "--init-file", "--rcfile"})
+_INTERPRETER_PROGRAM_FLAGS: dict[str, frozenset[str]] = {
+    "python": frozenset({"-c", "-m"}),
+    "python2": frozenset({"-c", "-m"}),
+    "python3": frozenset({"-c", "-m"}),
+    "node": frozenset({"-c", "--check", "-e", "--eval", "-p", "--print"}),
+    "perl": frozenset({"-e", "-E"}),
+    "ruby": frozenset({"-e"}),
+    "php": frozenset({"-f", "--file", "-r", "--run"}),
+    "lua": frozenset({"-e"}),
+    "osascript": frozenset({"-e"}),
+    "pwsh": frozenset({"-c", "-Command", "-command", "-File", "-file"}),
+    "powershell": frozenset({"-c", "-Command", "-command", "-File", "-file"}),
+    "powershell.exe": frozenset({"-c", "-Command", "-command", "-File", "-file"}),
+    "Rscript": frozenset({"-e"}),
+    "julia": frozenset({"-e", "-E"}),
+}
+_INTERPRETER_VALUE_OPTIONS: dict[str, frozenset[str]] = {
+    "python": frozenset({"-W", "-X", "--check-hash-based-pycs"}),
+    "python2": frozenset({"-W"}),
+    "python3": frozenset({"-W", "-X", "--check-hash-based-pycs"}),
+    "node": frozenset({"-r", "--require", "--import", "--loader"}),
+    "perl": frozenset({"-I", "-M", "-m"}),
+    "ruby": frozenset({"-I", "-r"}),
+    "php": frozenset({"-c", "-d"}),
+    "lua": frozenset({"-l"}),
+    "osascript": frozenset({"-l"}),
+}
+_BARE_STDIN_INTERPRETERS = EXEC_INTERPRETERS - frozenset({"deno", "bun", "Rscript"})
+
+
+def _command_args(cmd) -> list[str]:
+    return [getattr(word, "raw", str(word)) for word in (getattr(cmd, "args", None) or [])]
+
+
+_DENO_RUN_VALUE_OPTIONS = frozenset({
+    "--cert",
+    "--config",
+    "--ext",
+    "--import-map",
+    "--location",
+    "--log-level",
+    "--seed",
+})
+_BUN_RUN_VALUE_OPTIONS = frozenset({
+    "--conditions",
+    "--cwd",
+    "--define",
+    "--elide-lines",
+    "--external",
+    "--filter",
+    "--jsx-factory",
+    "--jsx-fragment",
+    "--loader",
+    "--main-fields",
+    "--origin",
+    "--port",
+    "--preload",
+    "--tsconfig-override",
+    "-r",
+})
+
+
+def deno_bun_run_program_index(name: str, args: list[str]) -> int | None:
+    """定位 deno/bun 实际执行的程序操作数，跳过 run 前后的取值选项。"""
+    if args and args[0] == "-":
+        return 0
+    value_options = _DENO_RUN_VALUE_OPTIONS if name == "deno" else _BUN_RUN_VALUE_OPTIONS
+    index = 0
+    while index < len(args):
+        raw = args[index]
+        if raw == "run":
+            index += 1
+            break
+        if raw == "--" or not raw.startswith("-"):
+            return None
+        if raw in value_options:
+            index += 2
+        else:
+            index += 1
+    else:
+        return None
+
+    while index < len(args):
+        raw = args[index]
+        if raw == "--":
+            return index + 1 if index + 1 < len(args) else None
+        if raw in value_options:
+            index += 2
+            continue
+        if raw.startswith("-") and raw != "-":
+            index += 1
+            continue
+        return index
+    return None
+
+
+def _shell_reads_program_from_stdin(args: list[str]) -> bool:
+    index = 0
+    while index < len(args):
+        raw = args[index]
+        if raw == "--":
+            return index + 1 >= len(args) or args[index + 1] == "-"
+        if raw in _SHELL_VALUE_OPTIONS:
+            index += 2
+            continue
+        if raw.startswith(("--init-file=", "--rcfile=")):
+            index += 1
+            continue
+        if raw.startswith("-") and not raw.startswith("--") and raw != "-":
+            flags = raw[1:]
+            if "c" in flags:
+                return False
+            if "s" in flags:
+                return True
+            index += 1
+            continue
+        if raw.startswith("-") and raw != "-":
+            index += 1
+            continue
+        return raw == "-"
+    return True
+
+
+def _program_flag(raw: str, flags: frozenset[str]) -> str | None:
+    for flag in sorted(flags, key=len, reverse=True):
+        if raw == flag or (flag.startswith("--") and raw.startswith(flag + "=")):
+            return flag
+        if len(flag) == 2 and raw.startswith(flag) and len(raw) > len(flag):
+            return flag
+    return None
+
+
+def _interpreter_reads_program_from_stdin(name: str, args: list[str]) -> bool:
+    if name in {"deno", "bun"}:
+        program_index = deno_bun_run_program_index(name, args)
+        return program_index is not None and args[program_index] == "-"
+
+    program_flags = _INTERPRETER_PROGRAM_FLAGS.get(name, frozenset())
+    value_options = _INTERPRETER_VALUE_OPTIONS.get(name, frozenset())
+    index = 0
+    while index < len(args):
+        raw = args[index]
+        if raw == "--":
+            return index + 1 < len(args) and args[index + 1] == "-"
+        program_flag = _program_flag(raw, program_flags)
+        if program_flag is not None:
+            if raw == program_flag and index + 1 < len(args):
+                source = args[index + 1]
+                if name in {"pwsh", "powershell", "powershell.exe"} and source == "-":
+                    return True
+            return False
+        if raw in value_options:
+            index += 2
+            continue
+        if any(raw.startswith(option + "=") for option in value_options if option.startswith("--")):
+            index += 1
+            continue
+        if raw.startswith("-") and raw != "-":
+            index += 1
+            continue
+        return raw == "-"
+    return name in _BARE_STDIN_INTERPRETERS
+
+
 def is_pipeline_exec_sink(cmd) -> bool:
     """管道终点是否会执行上游字节流（shell / busybox sh / 解释器）。"""
     raw_name = getattr(cmd, "name", "") or ""
     name = normalize_cmd_name(raw_name)
-    if name in SHELLS or name in EXEC_INTERPRETERS:
-        return True
+    args = _command_args(cmd)
+    if name in SHELLS:
+        return _shell_reads_program_from_stdin(args)
+    if name in EXEC_INTERPRETERS:
+        return _interpreter_reads_program_from_stdin(name, args)
     if name in _MULTICALL_BUSYBOX:
-        args = getattr(cmd, "args", None) or getattr(cmd, "words", [])[1:]
         if not args:
             return False
-        first = getattr(args[0], "literal", None) or getattr(args[0], "raw", "") or ""
-        # busybox sh / busybox ash —— ash 也当 shell sink
-        return normalize_cmd_name(first) in SHELLS or normalize_cmd_name(first) == "ash"
+        applet = normalize_cmd_name(args[0])
+        if applet in SHELLS or applet == "ash":
+            return _shell_reads_program_from_stdin(args[1:])
     return False
 
 
@@ -381,7 +622,7 @@ _WRITE_ONLY_VALUE_OPTS = {
 }
 
 # 源是读、只有目的地是写
-_DEST_ONLY_COMMANDS = frozenset({"cp", "install", "rsync", "scp"})
+_DEST_ONLY_COMMANDS = frozenset({"install", "rsync", "scp"})
 _DEST_DIR_OPTS = frozenset({"-t", "--target-directory"})
 
 
@@ -397,7 +638,7 @@ _DEST_DIR_OPTS = frozenset({"-t", "--target-directory"})
 # ---------------------------------------------------------------------------
 
 # 位置参数里「最后一个是目的地、其余都是源」的命令
-_SRC_THEN_DEST_COMMANDS = frozenset({"cp", "mv", "install", "rsync", "scp"})
+_SRC_THEN_DEST_COMMANDS = frozenset({"install", "rsync", "scp"})
 
 # 「选项 + 值」形式指定输入文件
 _READ_VALUE_OPTS = {
@@ -425,6 +666,95 @@ READ_REDIRECT_OPS = frozenset({"<", "<<<"})
 
 # tar 传统无横杠写法的合法模式字母，用于区分 `czf` 与真实路径操作数
 _TAR_MODE_LETTERS = frozenset("cxtrufzjJvpahmkPWO")
+
+
+def _word_path_text(word: object) -> str:
+    return str(getattr(word, "path_text", getattr(word, "raw", word)))
+
+
+@dataclass(frozen=True)
+class _PathOperand:
+    """从附着选项中切出的路径，同时保持 WordSpec 的路径访问契约。"""
+
+    raw: str
+    folded: str | None = None
+
+    @property
+    def path_text(self) -> str:
+        return self.folded if self.folded is not None else self.raw
+
+
+def _attached_path_operand(word: object, start: int) -> _PathOperand:
+    raw = getattr(word, "raw", str(word))[start:]
+    folded_word = getattr(word, "folded", None)
+    folded = folded_word[start:] if isinstance(folded_word, str) else None
+    return _PathOperand(raw=raw, folded=folded)
+
+
+def split_cp_mv_operands(args: list) -> tuple[list, object | None, bool]:
+    """按 cp/mv 语义拆出源、目标和 `-t` 模式，跳过取值选项。"""
+    positionals: list = []
+    target_directory: object | None = None
+    after_options = False
+    index = 0
+    while index < len(args):
+        word = args[index]
+        raw = getattr(word, "raw", str(word))
+        path_text = _word_path_text(word)
+        if after_options:
+            positionals.append(word)
+            index += 1
+            continue
+        if raw == "--":
+            after_options = True
+            index += 1
+            continue
+        if raw in {"-t", "--target-directory", "-S", "--suffix"}:
+            if index + 1 < len(args):
+                if raw in _DEST_DIR_OPTS:
+                    target_directory = args[index + 1]
+                index += 2
+            else:
+                index += 1
+            continue
+        if raw.startswith("--target-directory="):
+            target_directory = _attached_path_operand(word, raw.index("=") + 1)
+            index += 1
+            continue
+        if raw.startswith("--suffix="):
+            index += 1
+            continue
+        if raw.startswith("-") and not raw.startswith("--") and raw != "-":
+            short = raw[1:]
+            value_options = [(short.find(letter), letter) for letter in ("t", "S")]
+            value_options = [(pos, letter) for pos, letter in value_options if pos >= 0]
+            if value_options:
+                pos, letter = min(value_options)
+                attached = path_text[2 + pos :]
+                if attached:
+                    if letter == "t":
+                        target_directory = _attached_path_operand(word, 2 + pos)
+                    index += 1
+                elif index + 1 < len(args):
+                    if letter == "t":
+                        target_directory = args[index + 1]
+                    index += 2
+                else:
+                    index += 1
+                continue
+            index += 1
+            continue
+        if raw.startswith("--"):
+            index += 1
+            continue
+        positionals.append(word)
+        index += 1
+
+    if target_directory is not None:
+        return positionals, target_directory, True
+    if len(positionals) < 2:
+        return [], None, False
+    return positionals[:-1], positionals[-1], False
 
 
 def _kv_option_values(args: list, keys: frozenset[str]) -> list:
@@ -482,6 +812,10 @@ def iter_read_sources(name: str, args: list, read_only_commands: frozenset[str])
     if name == "xargs":
         # xargs -a FILE / --arg-file=FILE：从文件读参数列表，等同读源
         return _option_values(args, frozenset({"-a", "--arg-file"}))
+
+    if name in {"cp", "mv"}:
+        sources, _, _ = split_cp_mv_operands(args)
+        return sources
 
     if name in _SRC_THEN_DEST_COMMANDS:
         positional = _positional_args(_skip_read_only_options(name, args))
@@ -643,10 +977,18 @@ def iter_write_targets(name: str, args: list, read_only_commands: frozenset[str]
             return [archive] if archive is not None else []
         return []
 
-    if name in _WRITE_ONLY_VALUE_OPTS:
+    if name in {"cp", "mv"}:
+        sources, destination, _ = split_cp_mv_operands(args)
+        if destination is None:
+            candidates = []
+        elif name == "mv":
+            candidates = [*sources, destination]
+        else:
+            candidates = [destination]
+    elif name in _WRITE_ONLY_VALUE_OPTS:
         candidates = _option_values(args, _WRITE_ONLY_VALUE_OPTS[name])
     elif name in _DEST_ONLY_COMMANDS:
-        # cp/rsync/scp：源只是读；-t DIR 指定目的地时所有位置参数都是源
+        # install/rsync/scp：源只是读，最后一个位置参数是目的地。
         dest_dirs = _option_values(args, _DEST_DIR_OPTS)
         if dest_dirs:
             candidates = dest_dirs
@@ -735,4 +1077,3 @@ def _path_args_after_script(name: str, args: list) -> list:
             script_seen = True
         i += 1
     return paths
-

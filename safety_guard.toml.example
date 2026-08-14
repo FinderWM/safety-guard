@@ -1,21 +1,24 @@
-# Safety Guard 配置文件
+# Safety Guard 配置示例
+#
+# 复制为安装根目录下的 safety_guard.toml 后按需修改：
+#   cp safety_guard.toml.example safety_guard.toml
+# 实际配置文件已被 Git 忽略；不创建时使用 safety_guard/config.py 的安全默认值。
 #
 # 查找顺序：
 #   1. 环境变量 SAFETY_GUARD_CONFIG 指向的文件
-#   2. 安装根目录下的 safety_guard.toml（推荐，跟随 hook 一起迁移）
-#   3. ~/.agents/hooks/safety-guard/safety_guard.toml（默认安装位置）
-#   4. ~/.claude/hooks/safety_guard.toml（更老位置兜底）
+#   2. 安装根目录下的 safety_guard.toml
+# 安装根目录由 safety_guard/config.py 根据入口脚本位置计算。
 #
 # 所有字段都可省略，省略则用 config.py 里的默认值。
 # 修改后无需重启 CLI，下次 hook 调用即生效（每次启动重新加载）。
 #
 # 环境变量优先级高于本文件：
 #   SAFETY_GUARD_FAIL_OPEN=1  hook 报错时放行（默认 fail-closed）
-#   SAFETY_GUARD_DRY_RUN=1    永远 allow 但写审计（上线新规则前观察用）
+#   SAFETY_GUARD_DRY_RUN=1    安全规则不阻断，但保留原生权限流程并写审计
 #   SAFETY_GUARD_NO_AUDIT=1  不写审计（pytest / --regression / 手工回放专用）
 #   SAFETY_GUARD_IGNORE_DISABLED_RULES=1  忽略下面的 disabled_rules（测试用）
 # 临时禁用某条规则（不需要时留空数组）
-# 改 safety_guard 包内文件时可临时加入 file-critical-path-write；改完务必清空。
+# 改 safety_guard 包内文件时可临时加入 file-critical-path-write / bash-disable-safety-hook；改完务必清空。
 disabled_rules = []
 
 # git push --force 拦截的保护分支
@@ -44,7 +47,7 @@ read_only_commands = [
 ]
 
 # 前缀包装命令：剥掉后按内层真命令分发规则。
-# 不剥的话 `rtk rm -rf /`、`sudo rm -rf /`、`env A=1 rm -rf /` 会绕过全部
+# 不剥的话 `rtk rm -rf /`、`sudo env FOO=1 rm …` 会绕过全部
 # 按命令名匹配的规则（audit 显示 codex 侧 80% 的命令带 rtk 前缀）。
 wrapper_commands = [
   "rtk", "sudo", "doas", "env", "nohup", "command", "builtin", "exec",
@@ -73,6 +76,13 @@ critical_paths = [
 fail_open = false
 
 dry_run = false
+
+# 默认只记录摘要元数据，不写命令、补丁或文件正文。
+audit_include_body = false
+
+# 未知工具先进入 reviewer；noop 明确 abstain，不改变平台原生权限流程。
+unknown_reviewer = "noop"
+reviewer_timeout_ms = 250
 
 # 审计日志（默认在安装根目录下的 audit/）
 # audit_dir = "~/.agents/hooks/safety-guard/audit"

@@ -54,20 +54,84 @@ def test_canonical_runtime_environment_overrides_config(
     assert cfg.dry_run is True
 
 
+def test_example_config_is_valid_and_keeps_all_rules_enabled():
+    example = Path(__file__).resolve().parent.parent / "safety_guard.toml.example"
+
+    cfg = config_module.load(example)
+
+    assert cfg.load_error is None
+    assert cfg.disabled_rules == ()
+    assert cfg.fail_open is False
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        'fail_open = "false"\n',
+        'protected_branches = "main"\n',
+        '[severity_overrides]\nbash-rm-targeted = "low"\n',
+    ],
+)
+def test_invalid_safety_types_fall_back_to_fail_closed(
+    tmp_path: Path,
+    body: str,
+):
+    config_path = tmp_path / "invalid-safety-guard.toml"
+    config_path.write_text(body, encoding="utf-8")
+
+    cfg = config_module.load(config_path)
+
+    assert cfg.load_error == "config_invalid"
+    assert cfg.fail_open is False
+    assert cfg.protected_branches == ("main", "master", "release/*")
+
+
 def test_unknown_adapter_is_rejected():
     with pytest.raises(ValueError, match="unknown adapter"):
         get("missing")
 
 
-def test_unknown_tool_fails_closed(tmp_path: Path):
+def test_unknown_tool_uses_default_allow(tmp_path: Path):
     output = runner.run(
         _claude_input("UnknownTool", {}, tmp_path),
         adapter=get("claude"),
         config=_fail_closed_config(),
     )
-    reason = output["hookSpecificOutput"]["permissionDecisionReason"]
-    assert output["hookSpecificOutput"]["permissionDecision"] == "deny"
-    assert "unsupported Claude tool" in reason
+    assert output == {}
+
+
+@pytest.mark.parametrize(
+    ("adapter_name", "event"),
+    [
+        ("claude", "PreToolUse"),
+        ("codex-pretool", "PreToolUse"),
+        ("codex-permission", "PermissionRequest"),
+        ("grok", "PreToolUse"),
+    ],
+)
+def test_missing_tool_name_fails_closed(adapter_name: str, event: str, tmp_path: Path):
+    output = runner.run(
+        {"hook_event_name": event, "tool_input": {}, "cwd": str(tmp_path)},
+        adapter=get(adapter_name),
+        config=_fail_closed_config(),
+    )
+
+    if adapter_name == "grok":
+        assert output["decision"] == "deny"
+    elif adapter_name == "codex-permission":
+        assert output["hookSpecificOutput"]["decision"]["behavior"] == "deny"
+    else:
+        assert output["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+def test_dry_run_bash_parse_error_does_not_block(tmp_path: Path):
+    output = runner.run(
+        _claude_input("Bash", {"command": "apply_patch <<'"}, tmp_path),
+        adapter=get("claude"),
+        config=replace(_fail_closed_config(), dry_run=True),
+    )
+
+    assert output == {}
 
 
 def test_invalid_tool_input_fails_closed(tmp_path: Path):
@@ -144,4 +208,3 @@ def test_post_tool_use_still_ignored(tmp_path: Path):
         config=_fail_closed_config(),
     )
     assert output == {}
-

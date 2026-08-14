@@ -77,6 +77,7 @@ BENIGN = [
     "TZ=UTC date",
     'PATH="$PATH" git status',
     'PATH="./bin:$PATH" true',
+    "PATH=/tmp/evil :",
     'export PATH="/usr/local/bin:$PATH"',
 ]
 

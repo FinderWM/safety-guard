@@ -9,7 +9,8 @@ Safety Guard 将不同工具平台的 Hook 输入统一转换为内部操作，�
 - 规则只依赖规范化 Context。
 - `__init__.py` 不负责导入、注册或自动加载。
 - 新平台优先通过新增 Adapter 接入，不修改 Engine。
-- 静态分析，不可解释 ⇒ 标记，不静默 allow；包装不降低防护等级。
+- 静态分析只拦截已建模且命中规则的行为；未知工具进入 reviewer，默认 abstain。
+- 已建模路径或脚本不可解释时标记为 medium；包装不降低防护等级。
 
 ## 运行链路
 
@@ -22,24 +23,21 @@ Adapter.parse()
     ▼
 NormalizedRequest
     │
-    ├── Operation 1
-    ├── Operation 2
-    └── Operation N
-    │
-    ▼
-Engine.evaluate()
-    │
-    ├── Context.build()
-    │     ├── Bash → bash_ast.parse/expand + folding + opaque 收集
-    │     └── Write/Edit/NotebookEdit → paths.classify + disk lstat
-    ├── Rules.match()
-    └── Audit.write()
+    ├── unknown → Reviewer（默认 abstain）
+    └── modeled → Operation 1..N
+                     │
+                     ▼
+                 Engine.evaluate()
+                     ├── Context.build()
+                     └── Rules.match()
     │
     ▼
 DecisionResult
     │
     ▼
 Adapter.render()
+    │
+    ├── Audit.record_evaluation()
     │
     ▼
 平台原生 Hook JSON
@@ -60,7 +58,7 @@ Adapter 负责协议翻译，Engine 只处理统一数据结构。一个平台�
 
 ```text
 safety-guard.py          # 统一入口：Hook stdin 或调试 CLI
-safety_guard.toml        # 运行时配置（可随安装目录迁移）
+safety_guard.toml.example # 配置示例；实际 safety_guard.toml 由使用者创建
 GUIDE.md
 tools/
 └── replay.py            # 审计日志回放 / 决策基线对比
@@ -69,16 +67,17 @@ safety_guard/
 │   ├── base.py          # Adapter Protocol
 │   ├── claude.py
 │   ├── codex.py         # PreToolUse + PermissionRequest + apply_patch/MCP 解析
-│   ├── grok.py          # Grok pre_tool_use / 顶层 decision
+│   ├── grok.py          # Grok PreToolUse / 顶层 decision
 │   ├── fields.py        # tool_input / cwd 字段别名
 │   └── registry.py
 ├── rules/
 │   ├── base.py
 │   ├── registry.py      # 按模块名字典序显式 import 并 @register
-│   └── <rule>.py        # 当前 38 条
+│   └── <rule>.py        # 当前 43 条
 ├── contracts.py         # Operation / NormalizedRequest / DecisionResult
 ├── runner.py            # stdin ↔ Adapter ↔ Engine
-├── engine.py            # 聚合决策 + 审计
+├── engine.py            # 规则聚合与 unknown reviewer 分流
+├── reviewer.py          # 可插拔未知行为审查入口与脱敏摘要
 ├── context.py           # BashContext / FileToolContext
 ├── config.py
 ├── audit.py
@@ -104,12 +103,13 @@ tests/
 | `adapters/` | 解析平台输入并渲染平台输出 |
 | `adapters/registry.py` | 注册和选择 Adapter |
 | `runner.py` | 连接标准输入、Adapter 和 Engine |
-| `engine.py` | 构造 Context、执行规则并聚合决策 |
+| `engine.py` | 构造 Context、执行规则、聚合决策并分流未知行为 |
+| `reviewer.py` | reviewer 注册、超时/递归保护和最小化脱敏摘要 |
 | `context.py` | 将 Operation 转换为规则可消费的 Context |
 | `bash_ast.py` | 解析命令、剥 wrapper、展开 `sh -c` 字面载荷、收集 opaque |
 | `expand.py` | 路径槽位的 brace / ANSI-C 等确定性展开 |
 | `folding.py` | 把 `A=$HOME/.s; cat $A$B` 折成确定字面量 |
-| `paths.py` | 路径分类（不 follow symlink；链接位置决定归属） |
+| `paths.py` | 词法路径分类；写入、critical path 与外传规则额外检查 symlink 实际目标 |
 | `helpers.py` | 规则侧共用遍历与判定 |
 | `rules/base.py` | 定义 Rule 和 RuleMatch |
 | `rules/registry.py` | 显式加载并注册规则 |
@@ -139,6 +139,7 @@ Operation(
 - `Write`
 - `Edit`
 - `NotebookEdit`
+- `Read`
 
 不同平台的原始工具名不需要一致，只需由 Adapter 映射为这些内部操作。
 
@@ -167,7 +168,10 @@ NormalizedRequest(
 - `tool`：用于审计的顶层工具名（可与内部 Operation.tool 不同）。
 - `operations`：Engine 实际检查的操作列表。
 - `cwd`：本次调用的工作目录。
-- `audit_input`：写入审计日志的原始输入。
+- `audit_input`：用于审计摘要的数据源；仅显式开启正文审计时保存脱敏内容。
+- `classification`：`modeled`、`known-noop` 或 `unknown`。
+- `raw_input` / `input_keys`：未知工具的进程内载荷与字段形状；不会直接写审计或交给 reviewer。
+- `provenance`：审查链来源与递归保护标记。
 
 ### DecisionResult
 
@@ -178,11 +182,12 @@ DecisionResult(
 )
 ```
 
-Engine 只返回三种统一决策：
+Engine 返回四种统一决策：
 
 - `allow`
 - `ask`
 - `deny`
+- `abstain`
 
 平台是否使用 `hookSpecificOutput`、`systemMessage` 或其他字段，由 Adapter 决定。
 
@@ -219,9 +224,9 @@ command
 | Adapter 名 | 平台事件 | 输入工具 |
 | --- | --- | --- |
 | `claude` | Claude Code `PreToolUse` | `Bash` / `Write` / `Edit` / `NotebookEdit` / `Read` / `Grep` / `Glob` |
-| `codex-pretool` | Codex `PreToolUse` | `Bash`/`shell`、`apply_patch`、`Edit`/`Write`、已建模的 Chrome DevTools MCP 路径工具 |
+| `codex-pretool` | Codex `PreToolUse` | `Bash`/`shell`、`apply_patch`、`Edit`/`Write`/`Read`、`view_image`、Chrome DevTools MCP 与未知本地工具入口 |
 | `codex-permission` | Codex `PermissionRequest` | 同上 |
-| `grok` | Grok `pre_tool_use` / `PreToolUse` | `run_terminal_command` / `write` / `search_replace` / `read_file` / `list_dir` / `grep`（及 Bash/Write/Edit/Read 别名） |
+| `grok` | Grok `PreToolUse`（兼容 `pre_tool_use`） | `run_terminal_command` / `write` / `search_replace` / `read_file` / `list_dir` / `grep`（及 Bash/Write/Edit/Read 别名） |
 
 选择优先级：
 
@@ -239,20 +244,22 @@ python3 safety-guard.py --adapter grok
 
 ### Claude 渲染
 
-- `allow` → 空对象 `{}`（平台默认放行）
+- `allow` / `abstain` → 空对象 `{}`（不替代平台原生权限流程）
 - `ask` / `deny` → `hookSpecificOutput.permissionDecision` + reason
 
 ### Codex 渲染
 
-- `allow` → `{}`
-- `ask` / `deny` + PreToolUse → `permissionDecision: deny`（medium 升 deny，避免只提示不拦）
-- `ask` / `deny` + PermissionRequest → `decision.behavior: deny`
+- `allow` / `abstain` → `{}`；策略 allow 不等于平台授权
+- `ask` + PreToolUse → `{}`，因为 Codex 当前不支持 ask，且不把 medium 升成 deny
+- `ask` + PermissionRequest → `{}`，保留 Codex 原生审批
+- `deny` → 对应事件的原生 deny 结构
+- reviewer 明确 allow + PermissionRequest → `decision.behavior: allow`
 
 ### Grok 渲染
 
-- `allow` → `{"decision": "allow"}`
-- `ask` / `deny` → `{"decision": "deny", "reason": "..."}`（无 ask UI，medium 升 deny）
-- 输入兼容 camelCase（`hookEventName` / `toolName` / `toolInput`）与 snake_case
+- `allow` / `ask` / `abstain` → 空对象 `{}`；退出 0 且无输出即继续原生权限流程
+- `deny` → `{"decision": "deny", "reason": "..."}`
+- 官方输入使用 camelCase（`hookEventName` / `toolName` / `toolInput`），同时兼容 snake_case
 - `search_replace`：空 `old_string` → 内部 `Write`；非空 → 内部 `Edit`
 - 原生工具名 `write`（小写）映射为内部 `Write`
 - `read_file` / `list_dir` / `grep`（及 Claude `Read`/`Grep`/`Glob`）映射为内部 `Read`；指令区只读仍豁免
@@ -274,13 +281,15 @@ python3 safety-guard.py --adapter grok
 ### Codex MCP 与未知工具
 
 当前 Chrome DevTools MCP 中，9 个读取或写入本机路径的工具会转换为
-`Read` / `Write` / `Edit` Operation；其余 20 个无本机路径工具显式识别但不进入
-用户级 matcher。`upload_file` 额外标记为外部上传并由 high 规则拒绝。
+`Read` / `Write` / `Edit` Operation；其余无本机路径工具标为 `known-noop`。
+`upload_file` 额外标记为外部上传：工作区普通文件为 medium，敏感/CWD 外/symlink
+外传为 high。
 
-matcher 只列已建模工具，不使用 `mcp__chrome_devtools__.*`。未知工具直接收到时
-生成空 Operation 放行，同时保留独立归一化入口；未来应在确认新工具 schema 后，
-同时扩展 Adapter、matcher 和测试。已建模工具的路径字段或 `tool_input` 畸形仍
-fail-closed。
+Codex 的 `PreToolUse` 与 `PermissionRequest` matcher 均使用 `.*`，使所有当前支持的
+本地函数工具进入前置流程。未知工具不猜测 schema，也不产生规则 Operation，而是标为
+`unknown` 后进入 reviewer。默认 `noop` 返回 `abstain`；超时、异常、递归和非法结果也
+统一 abstain。reviewer 只收到字段形状、长度、脱敏路径和 URL 主机等摘要，不收到命令、
+补丁、正文或凭据原值。已建模工具的路径字段或 `tool_input` 畸形仍 fail-closed。
 
 ## 审计字段（优化拦截）
 
@@ -289,17 +298,20 @@ fail-closed。
 | 字段 | 含义 |
 | --- | --- |
 | `adapter` | 平台适配器（`claude` / `grok` / `codex-*`） |
-| `engine_decision` | 规则引擎结论 `allow`/`ask`/`deny` |
-| `rendered_decision` | 写入平台后的对外结论（如 Grok 将 ask 升为 deny） |
+| `engine_decision` | 规则引擎或 reviewer 结论 `allow`/`ask`/`deny`/`abstain` |
+| `rendered_decision` | Adapter 输出的显式决策；无决策为 `abstain`，Grok 无输出按官方协议记为 `allow` |
 | `decision` | 兼容旧字段，等于 `engine_decision`（`dry_run` 时带 `dry-run-` 前缀） |
-| `cmd_body` | 脱敏后的完整输入（≤8192 字符时存在，供精确回放） |
-| `cmd_truncated` | 超长为 true，此时仅有 `cmd_preview` |
-| `cmd_preview` | 预览（保留换行；超长截断到 4096+…） |
+| `cmd_digest` / `cmd_chars` / `cmd_lines` | 默认保存的正文摘要元数据 |
+| `cmd_body_stored` | 是否显式启用了正文审计 |
+| `cmd_body` / `cmd_preview` | 仅 `audit_include_body=true` 时保存的脱敏正文 |
 | `hook_event` | 规范化事件名 |
-| `matches` | 命中规则 id/severity/reason/extra |
+| `classification` | `modeled` / `known-noop` / `unknown` |
+| `review` | reviewer 名称、状态与无敏感详情的错误类型 |
+| `matches` | 默认仅规则 id/severity；正文审计开启后才含 reason/extra |
 | `config_load_error` | 配置读取、解析或校验失败的类型（不含底层异常详情） |
 
-`tools/replay.py` 优先用 `cmd_body`，并与 `engine_decision` 对比。
+`tools/replay.py` 只有在审计显式保存 `cmd_body` 时才能精确回放，并与
+`engine_decision` 对比。
 审计目录固定为 `0700`，日志文件固定为 `0600`。
 
 ## 接入新平台
@@ -311,12 +323,13 @@ fail-closed。
 ```python
 from typing import Any
 
-from .base import Adapter
+from .base import AdapterCapabilities
 from ..contracts import DecisionResult, NormalizedRequest, Operation
 
 
 class ExampleAdapter:
     name = "example"
+    capabilities = AdapterCapabilities(supports_ask=True)
 
     def parse(self, stdin_json: dict[str, Any]) -> NormalizedRequest | None:
         if stdin_json.get("event") != "before_tool":
@@ -342,6 +355,7 @@ class ExampleAdapter:
 Adapter 的约束：
 
 - 无关事件返回 `None`。
+- 未知工具使用 `unknown_request()` 进入 reviewer，不猜测工具 schema。
 - 非法输入抛出异常，由 Runner 按 `fail_open` 处理。
 - 不直接执行规则。
 - 不读取规则 Registry。
@@ -366,8 +380,8 @@ python3 safety-guard.py --adapter example
 
 ### 新增内部操作
 
-只有当新平台能力无法映射到现有 `Bash`、`Write`、`Edit` 或
-`NotebookEdit` 时，才新增内部 Operation 类型。
+只有当新平台能力无法映射到现有 `Bash`、`Write`、`Edit`、`NotebookEdit` 或
+`Read` 时，才新增内部 Operation 类型。
 
 此时需要：
 
@@ -411,7 +425,7 @@ class ExampleRule(Rule):
 `ctx.classify()`；文件工具用 `ctx.target_path` / `ctx.classification` /
 `ctx.file_exists` / `ctx.patch_action`。共用逻辑放 `helpers.py`，不要在规则里重解析命令。
 
-### 当前规则一览（38）
+### 当前规则一览（43）
 
 `python3 safety-guard.py --list-rules` 可打印完整描述。
 
@@ -424,13 +438,13 @@ class ExampleRule(Rule):
 | `bash-eval-from-network` | Bash | `eval` / `sh -c` 包裹网络抓取 |
 | `bash-find-delete-unbounded` | Bash | `find /` 或 `find ~` + `-delete` / `-exec rm` |
 | `bash-git-push-force-protected` | Bash | `git push --force` 到保护分支 |
-| `bash-interpreter-shell-escape` | Bash | 解释器内联载荷里再调 shell |
+| `bash-interpreter-shell-escape` | Bash | 动态 argv / shell 覆盖 / 解释器内再调 shell |
 | `bash-pipe-to-shell` | Bash | `curl\|sh` / `curl\|/bin/bash` / `curl\|python3` / `nc\|bash` 等管道执行 |
 | `bash-remote-stdin-exec` | Bash | shell/source 从 stdin/进程替换执行且含网络抓取 |
 | `bash-rm-root-or-home` | Bash | `rm` 目标为 `/` 或 `$HOME` |
 | `bash-sql-drop-database` | Bash | `DROP DATABASE` / `DROP SCHEMA` |
 | `file-critical-path-write` | Write/Edit/NotebookEdit | 写入 critical_paths |
-| `file-external-upload` | Read | 把本机文件上传到本地规则无法验证的外部页面 |
+| `file-external-upload` | Read | 上传敏感、CWD 外或 symlink 外指文件 |
 | `bash-interpreter-write` | Bash | 解释器 -c/-e 写/删 critical_paths |
 
 ### medium → ask
@@ -441,10 +455,13 @@ class ExampleRule(Rule):
 | `bash-credential-export` | Bash | gpg/security/kubectl 等凭据导出或密钥读取 |
 | `bash-find-exec-rm` | Bash | 非根/家起点 `find -delete` 或 `-exec` + rm 家族 |
 | `bash-interpreter-write` | Bash | 解释器 -c/-e 写/删非 critical 文件 |
+| `bash-interpreter-shell-escape` | Bash | 固定可读 argv 的解释器子进程调用 |
 | `bash-util-overwrite-existing` | Bash | `truncate` / `dd of=` 覆盖已存在文件 |
 | `bash-gh-close` | Bash | `gh` 关闭/删除远端资源 |
 | `bash-git-destructive` | Bash | `reset --hard` / `clean -f` / `branch -D` 等 |
+| `bash-git-push` | Bash | 普通 `git push` 修改远端状态 |
 | `bash-instruction-zone-write` | Bash | 写指令区 |
+| `bash-interactive-shell` | Bash | 无脚本参数的交互/stdin shell |
 | `bash-interpreter-remote-exec` | Bash | 解释器载荷同时网络取指 + exec/eval |
 | `bash-interpreter-outside-path` | Bash | 解释器 -c/-e 字面量越界路径 |
 | `bash-opaque-inline-script` | Bash | 内联/占位/进程替换/stdin 脚本，内层静态不可见 |
@@ -455,13 +472,18 @@ class ExampleRule(Rule):
 | `bash-rm-targeted` | Bash | 非根/家的 `rm` |
 | `bash-sensitive-path-scan` | Bash | 敏感路径/密钥字面量（含 expand 候选） |
 | `bash-sql-delete-truncate` | Bash | `DELETE` / `TRUNCATE` |
+| `bash-sql-drop-database` | Bash | `DROP TABLE`（数据库/schema 仍为 high） |
 | `bash-symlink-create` | Bash | `ln` / `ln -s` / `cp -s` |
 | `bash-tee-overwrite-existing` | Bash | 无 `-a` 的 `tee` |
+| `bash-kubectl-delete-namespace` | Bash | 删除 Kubernetes namespace |
+| `bash-terraform-destroy` | Bash | `terraform destroy` 删除托管资源 |
 | `bash-unresolvable-path` | Bash | 路径槽静态不可解释 |
+| `file-external-upload` | Read | 上传工作区内普通文件 |
 | `file-instruction-zone-write` | Write/Edit/NotebookEdit | 写指令区 |
 | `file-outside-cwd` | Write/Edit/NotebookEdit/Read | 目标在 CWD 外 |
 | `file-overwrite-existing` | Write | 整文件覆盖 |
 | `file-patch-delete` | Edit | apply_patch 删除 |
+| `file-symlink-write` | Write/Edit/NotebookEdit | 写入现有 symlink 或其下级路径 |
 | `notebook-delete` | NotebookEdit | `edit_mode=delete` |
 
 改包内文件时若命中自保，可临时把
@@ -475,6 +497,7 @@ Engine 对一次请求中的全部 Operation 执行规则：
 - 任意规则命中 `high`，最终结果为 `deny`。
 - 没有 `high`，但存在 `medium`，最终结果为 `ask`。
 - 没有规则命中，最终结果为 `allow`。
+- 未知工具不执行当前规则，交给 reviewer；默认结果为 `abstain`。
 - `severity_overrides` 可在聚合前改写单条 severity。
 
 规则执行异常会转换为 `high`，避免单条规则崩溃后静默放行。
@@ -485,11 +508,19 @@ Bash 解析失败默认 fail-closed。临时故障恢复可以使用：
 SAFETY_GUARD_FAIL_OPEN=1 python3 safety-guard.py --adapter codex-pretool
 ```
 
-`dry_run=true` 时仍写审计（决策前缀 `dry-run-`），但对平台始终返回 `allow`。
+`dry_run=true` 时仍写审计（决策前缀 `dry-run-`），但本 Hook 不输出阻断；平台
+原生权限流程仍保留。Codex `PermissionRequest` 仍记录为 `abstain`，不伪造显式 allow。
 
 ## 配置与环境变量
 
-主要配置位于安装根目录的 `safety_guard.toml`。
+仓库只提交 `safety_guard.toml.example`。使用者按需复制为安装根目录下、被 Git
+忽略的实际配置：
+
+```bash
+cp safety_guard.toml.example safety_guard.toml
+```
+
+不创建实际配置时使用 `config.py` 中的安全默认值。
 
 查找顺序（`config.py`）：
 
@@ -513,6 +544,8 @@ SAFETY_GUARD_FAIL_OPEN=1 python3 safety-guard.py --adapter codex-pretool
 | `wrapper_specs.<name>` | 包装剥层语义：`value_opts` / `skip_positional` / `subcommands` |
 | `critical_paths` | 高危路径（与默认自保合并） |
 | `fail_open` / `dry_run` | 行为开关 |
+| `unknown_reviewer` / `reviewer_timeout_ms` | 未知工具 reviewer 与超时 |
+| `audit_include_body` | 是否保存脱敏正文，默认 false |
 | `audit_dir` / `audit_retention_days` / `audit_max_*_mb` | 审计 |
 
 | 环境变量 | 作用 |
@@ -521,6 +554,7 @@ SAFETY_GUARD_FAIL_OPEN=1 python3 safety-guard.py --adapter codex-pretool
 | `SAFETY_GUARD_CONFIG` | 指定配置文件路径 |
 | `SAFETY_GUARD_FAIL_OPEN=1` | 内部异常 / 解析失败时放行 |
 | `SAFETY_GUARD_DRY_RUN=1` | 记录决策但始终放行 |
+| `SAFETY_GUARD_AUDIT_INCLUDE_BODY=1` | 显式允许审计保存脱敏正文 |
 | `SAFETY_GUARD_NO_AUDIT=1` | 禁用审计写入 |
 | `SAFETY_GUARD_IGNORE_DISABLED_RULES=1` | 忽略 `disabled_rules`（测试用） |
 

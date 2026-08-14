@@ -19,8 +19,6 @@ BENIGN = [
     "pnpm i",
     "git commit -m 'wip'",
     "git diff",
-    "git push origin feature/x",
-    "git push -f origin feature/x",  # 非保护分支强推允许
     "mkdir -p ./build",
     "curl https://example.com > out.html",
     "find . -name '*.py'",
@@ -93,3 +91,13 @@ def test_git_rebase_is_destructive(bash, cwd: Path):
     """git rebase 任意子命令保守 ask（含 --continue）。"""
     decision, _ = bash("git rebase --continue", cwd)
     assert decision == "ask"
+
+
+@pytest.mark.parametrize("command", [
+    "git push origin feature/x",
+    "git push -f origin feature/x",
+])
+def test_git_push_changes_remote_and_asks(bash, cwd: Path, command: str):
+    decision, reason = bash(command, cwd)
+    assert decision == "ask"
+    assert "bash-git-push" in (reason or "")

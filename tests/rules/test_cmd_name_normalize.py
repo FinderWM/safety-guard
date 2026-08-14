@@ -58,6 +58,44 @@ def test_python_is_exec_sink():
     assert is_pipeline_exec_sink(cmd)
 
 
+@pytest.mark.parametrize(
+    "words",
+    [
+        ["python3", "-m", "json.tool"],
+        ["python3", "-c", "print(1)"],
+        ["python3", "./script.py"],
+        ["bash", "./script.sh"],
+        ["busybox", "sh", "./script.sh"],
+    ],
+)
+def test_explicit_program_is_not_stdin_exec_sink(words: list[str]):
+    cmd = CommandSpec(name=words[0], words=[_w(word) for word in words], raw=" ".join(words))
+    assert not is_pipeline_exec_sink(cmd)
+
+
+@pytest.mark.parametrize(
+    ("words", "expected"),
+    [
+        (["deno", "run", "-"], True),
+        (["deno", "--config", "deno.json", "run", "-"], True),
+        (["deno", "run", "--config", "deno.json", "-"], True),
+        (["deno", "run", "--config=deno.json", "script.ts", "--", "-"], False),
+        (["deno", "run", "script.ts", "--", "-"], False),
+        (["bun", "run", "-"], True),
+        (["bun", "--preload", "setup.ts", "run", "-"], True),
+        (["bun", "run", "--preload", "setup.ts", "-"], True),
+        (["bun", "run", "--preload=setup.ts", "script.ts", "--", "-"], False),
+        (["bun", "run", "script.ts", "--", "-"], False),
+    ],
+)
+def test_deno_bun_only_treat_first_run_operand_as_stdin(
+    words: list[str],
+    expected: bool,
+):
+    cmd = CommandSpec(name=words[0], words=[_w(word) for word in words], raw=" ".join(words))
+    assert is_pipeline_exec_sink(cmd) is expected
+
+
 def test_ast_strips_bin_prefix():
     cfg = load_config()
     ast = expand(parse("/bin/rm -rf /tmp/x"), cfg.wrapper_commands)

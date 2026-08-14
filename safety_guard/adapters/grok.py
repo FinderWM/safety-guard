@@ -5,9 +5,10 @@ import json
 from typing import Any
 
 from ..contracts import DecisionResult, NormalizedRequest, Operation
+from .base import AdapterCapabilities, project_decision, unknown_request
 from . import fields
 
-# Grok stdin 使用 snake_case 事件名；PascalCase 与 matcher 别名一并接受。
+# Grok 官方事件名为 PreToolUse；保留 pre_tool_use 兼容旧载荷和代理层转换。
 _EVENTS = frozenset({"pre_tool_use", "PreToolUse"})
 _CANONICAL_EVENT = "PreToolUse"
 
@@ -82,6 +83,11 @@ def _audit_input(tool: str, raw_input: dict[str, Any], fallback: str) -> str:
 
 class GrokAdapter:
     name = "grok"
+    capabilities = AdapterCapabilities(
+        supports_ask=False,
+        ask_fallback="allow",
+        abstain_fallback="allow",
+    )
 
     def parse(self, stdin_json: dict[str, Any]) -> NormalizedRequest | None:
         event = fields.event_name(stdin_json)
@@ -92,7 +98,14 @@ class GrokAdapter:
         if raw_tool is None:
             raise ValueError("missing tool_name")
         if raw_tool not in _SUPPORTED_TOOLS:
-            raise ValueError(f"unsupported Grok tool: {raw_tool!r}")
+            raw_input = fields.safe_tool_input(stdin_json)
+            return unknown_request(
+                adapter=self.name,
+                event=self._canonical_event(event),
+                tool=raw_tool,
+                cwd=fields.cwd(stdin_json),
+                raw_input=raw_input,
+            )
 
         raw_input = fields.tool_input(stdin_json)
         cwd = fields.cwd(stdin_json)
@@ -111,13 +124,19 @@ class GrokAdapter:
             operations=(operation,),
             cwd=cwd,
             audit_input=_audit_input(internal_tool, raw_input, audit),
+            provenance=("adapter:grok",),
         )
 
+    @staticmethod
+    def _canonical_event(event: str) -> str:
+        return _CANONICAL_EVENT if event in _EVENTS else event
+
     def render(self, result: DecisionResult) -> dict[str, Any]:
-        # Grok PreToolUse 只认顶层 decision allow/deny；无 Claude 式 ask UI。
-        # medium(ask) 升为 deny，避免 fail-open 式“提示但不拦”。
-        if result.decision == "allow":
-            return {"decision": "allow"}
+        # Grok 只把显式顶层 deny 当作阻断；退出 0 且无输出即继续执行。
+        # medium/未知行为不伪造授权，静默交还平台原生权限流程。
+        decision = project_decision(result, self.capabilities)
+        if decision in ("allow", "abstain"):
+            return {}
         output: dict[str, Any] = {"decision": "deny"}
         if result.reason:
             output["reason"] = result.reason

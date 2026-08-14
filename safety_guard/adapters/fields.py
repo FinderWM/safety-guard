@@ -38,6 +38,14 @@ def tool_input(stdin_json: dict[str, Any]) -> dict[str, Any]:
     return {}
 
 
+def safe_tool_input(stdin_json: dict[str, Any]) -> dict[str, Any]:
+    """未知工具也保留一个内存副本；畸形未知参数不应触发检测拦截。"""
+    try:
+        return tool_input(stdin_json)
+    except ValueError:
+        return {}
+
+
 def cwd(stdin_json: dict[str, Any]) -> str:
     for key in _CWD_KEYS:
         value = stdin_json.get(key)

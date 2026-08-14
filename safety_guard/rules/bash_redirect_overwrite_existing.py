@@ -27,7 +27,7 @@ class BashRedirectOverwriteExisting(Rule):
             if r.op not in (">", ">|", "&>"):
                 continue
             try:
-                p = resolve(r.target.raw, ctx.policy)
+                p = resolve(r.target.path_text, ctx.policy)
             except Exception:
                 continue
             if is_null_device_path(p):
@@ -36,7 +36,7 @@ class BashRedirectOverwriteExisting(Rule):
                 return RuleMatch(
                     rule_id=self.id,
                     severity=self.severity,
-                    reason=f"重定向 `{r.op} {r.target.raw}` 将覆盖已存在文件 {p}",
+                    reason=f"重定向 `{r.op} {r.target.path_text}` 将覆盖已存在文件 {p}",
                     extra={"target": str(p), "op": r.op},
                 )
         return None

@@ -7,6 +7,7 @@ from typing import Any
 from .config import Config
 from .contracts import Decision, DecisionResult, NormalizedRequest
 from . import context
+from .reviewer import Reviewer, review_unknown
 from .rules.base import RuleMatch
 from .rules.registry import iter_rules_for_tool
 
@@ -16,6 +17,9 @@ def _apply_severity_overrides(matches: list[RuleMatch], cfg: Config) -> list[Rul
         return matches
     adjusted: list[RuleMatch] = []
     for m in matches:
+        if m.extra and m.extra.get("internal_error") is True:
+            adjusted.append(m)
+            continue
         sev = cfg.severity_overrides.get(m.rule_id, m.severity)
         if sev != m.severity:
             adjusted.append(RuleMatch(rule_id=m.rule_id, severity=sev, reason=m.reason, extra=m.extra))
@@ -54,14 +58,24 @@ def _decide(matches: list[RuleMatch]) -> tuple[Decision, str | None]:
 
 
 def _internal_result(reason: str, cfg: Config) -> DecisionResult:
+    if cfg.dry_run:
+        return DecisionResult(
+            "allow",
+            reason,
+            engine_decision="deny",
+            error_type="internal",
+            error_detail=reason,
+            decision_source="internal",
+        )
     if cfg.fail_open:
-        return DecisionResult("allow", engine_decision="allow")
+        return DecisionResult("allow", engine_decision="allow", decision_source="internal")
     return DecisionResult(
         "deny",
         f"[INTERNAL:safety-guard] {reason}",
         engine_decision="deny",
         error_type="internal",
         error_detail=reason,
+        decision_source="internal",
     )
 
 
@@ -71,12 +85,14 @@ def _collect_matches(tool: str, ctx, cfg: Config) -> list[RuleMatch]:
         try:
             m = rule.match(ctx)
         except Exception as e:
+            if cfg.fail_open:
+                continue
             tb = traceback.format_exc(limit=2)
             matches.append(RuleMatch(
                 rule_id=rule.id,
                 severity="high",
                 reason=f"规则 {rule.id} 执行异常：{e}",
-                extra={"traceback": tb},
+                extra={"traceback": tb, "internal_error": True},
             ))
             continue
         if m is not None:
@@ -84,11 +100,47 @@ def _collect_matches(tool: str, ctx, cfg: Config) -> list[RuleMatch]:
     return matches
 
 
-def evaluate(request: NormalizedRequest, cfg: Config) -> DecisionResult:
+def _review_decision(request: NormalizedRequest, cfg: Config, reviewer: Reviewer | None) -> DecisionResult:
+    reviewed = review_unknown(request, cfg, reviewer)
+    metadata = {
+        "reviewer": reviewed.reviewer,
+        "status": reviewed.status,
+    }
+    if reviewed.error_type:
+        metadata["error_type"] = reviewed.error_type
+    decision = reviewed.decision
+    reason = reviewed.reason or "未知工具保持默认放行策略"
+    if cfg.dry_run:
+        return DecisionResult(
+            "abstain",
+            reason,
+            engine_decision=decision,
+            review=metadata,
+            decision_source="reviewer",
+        )
+    return DecisionResult(
+        decision,
+        reason,
+        engine_decision=decision,
+        review=metadata,
+        decision_source="reviewer",
+    )
+
+
+def evaluate(
+    request: NormalizedRequest,
+    cfg: Config,
+    reviewer: Reviewer | None = None,
+) -> DecisionResult:
     """检查请求中的全部操作，并聚合为一个统一决策。
 
     不写审计：由 runner 在 render 之后统一落盘（才能记 rendered_decision）。
     """
+    if request.classification == "unknown":
+        return _review_decision(request, cfg, reviewer)
+    if request.classification == "known-noop" and not request.operations:
+        return DecisionResult("allow", engine_decision="allow")
+
     matches: list[RuleMatch] = []
     for operation in request.operations:
         try:
@@ -101,6 +153,15 @@ def evaluate(request: NormalizedRequest, cfg: Config) -> DecisionResult:
                 continue
             reason = _bash_parse_reason(ctx.parse_error)
             detail = f"[INTERNAL:safety-guard] {reason}"
+            if cfg.dry_run:
+                return DecisionResult(
+                    "allow",
+                    detail,
+                    engine_decision="deny",
+                    error_type="bash_parse_error",
+                    error_detail=reason,
+                    decision_source="internal",
+                )
             return DecisionResult(
                 "deny",
                 detail,

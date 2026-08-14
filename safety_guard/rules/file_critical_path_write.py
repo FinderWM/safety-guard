@@ -15,11 +15,21 @@ class FileCriticalPathWrite(Rule):
     description = "写入 critical_paths（如 ~/.codex/config.toml）直接拒绝"
 
     def match(self, ctx: FileToolContext) -> RuleMatch | None:
-        if not is_critical(ctx.target_path, ctx.config.critical_paths):
+        candidates = [ctx.target_path]
+        if ctx.disk.first_symlink(ctx.target_path, root=ctx.cwd) is not None:
+            try:
+                candidates.append(ctx.target_path.resolve(strict=False))
+            except (OSError, RuntimeError):
+                pass
+        critical_target = next(
+            (candidate for candidate in candidates if is_critical(candidate, ctx.config.critical_paths)),
+            None,
+        )
+        if critical_target is None:
             return None
         return RuleMatch(
             rule_id=self.id,
             severity=self.severity,
-            reason=f"{ctx.tool} 目标 {ctx.target_path} 位于 critical_paths，已拒绝",
-            extra={"target": str(ctx.target_path)},
+            reason=f"{ctx.tool} 目标 {ctx.target_path} 指向 critical path {critical_target}，已拒绝",
+            extra={"target": str(ctx.target_path), "critical_target": str(critical_target)},
         )

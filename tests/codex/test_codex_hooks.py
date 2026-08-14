@@ -53,12 +53,9 @@ def test_pretool_high_risk_denies(cwd: Path):
     assert "bash-git-push-force-protected" in out["hookSpecificOutput"]["permissionDecisionReason"]
 
 
-def test_pretool_medium_risk_is_denied(cwd: Path):
+def test_pretool_medium_risk_abstains(cwd: Path):
     out = _run(_pretool("rm -rf /tmp/foo", cwd), "codex-pretool")
-    hs = out["hookSpecificOutput"]
-    assert hs["hookEventName"] == "PreToolUse"
-    assert hs["permissionDecision"] == "deny"
-    assert "bash-rm-targeted" in hs["permissionDecisionReason"]
+    assert out == {}
 
 
 def test_permission_high_risk_denies(cwd: Path):
@@ -69,12 +66,9 @@ def test_permission_high_risk_denies(cwd: Path):
     assert "bash-disable-safety-hook" in decision["message"]
 
 
-def test_permission_medium_risk_is_denied(cwd: Path):
+def test_permission_medium_risk_preserves_native_approval(cwd: Path):
     out = _run(_permission("rm -rf /tmp/foo", cwd), "codex-permission")
-    hs = out["hookSpecificOutput"]
-    assert hs["hookEventName"] == "PermissionRequest"
-    assert hs["decision"]["behavior"] == "deny"
-    assert "bash-rm-targeted" in hs["decision"]["message"]
+    assert out == {}
 
 
 def test_permission_apply_patch_denies_on_critical_target(cwd: Path):
@@ -111,7 +105,7 @@ def test_permission_apply_patch_denies_if_any_operation_is_high_risk(cwd: Path):
     assert "file-critical-path-write" in decision["message"]
 
 
-def test_permission_apply_patch_delete_is_denied(cwd: Path):
+def test_permission_apply_patch_delete_preserves_native_approval(cwd: Path):
     target = cwd / "legacy.txt"
     target.write_text("legacy")
     patch = f"""*** Begin Patch
@@ -119,9 +113,7 @@ def test_permission_apply_patch_delete_is_denied(cwd: Path):
 *** End Patch
 """
     out = _run(_permission(patch, cwd, tool_name="apply_patch"), "codex-permission")
-    hs = out["hookSpecificOutput"]
-    assert hs["decision"]["behavior"] == "deny"
-    assert "file-patch-delete" in hs["decision"]["message"]
+    assert out == {}
 
 
 def test_pretool_bash_parse_error_is_audited(cwd: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -137,7 +129,7 @@ def test_pretool_bash_parse_error_is_audited(cwd: Path, tmp_path: Path, monkeypa
     assert '"decision": "deny"' in record
     assert '"error_type": "bash_parse_error"' in record
     assert '"cmd_chars":' in record
-    assert '"error_detail":' in record
+    assert '"error_detail":' not in record
 
 
 @pytest.mark.parametrize("command", [

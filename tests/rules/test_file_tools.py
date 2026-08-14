@@ -38,7 +38,7 @@ def test_edit_inside_cwd_existing_allow(file_tool, cwd: Path):
 
 
 def test_edit_outside_cwd_ask(file_tool, cwd: Path):
-    d, reason = file_tool("Edit", "/etc/something", cwd)
+    d, reason = file_tool("Edit", "/nonexistent-probe/etc/something", cwd)
     assert d == "ask" and "file-outside-cwd" in (reason or "")
 
 

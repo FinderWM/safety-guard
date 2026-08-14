@@ -39,6 +39,21 @@ class DiskStat:
         st = self._stat(p)
         return st is not None and _s.S_ISLNK(st.st_mode)
 
+    def first_symlink(self, p: Path, *, root: Path | None = None) -> Path | None:
+        """返回目标到边界之间的第一个符号链接，不把边界自身视为目标组件。"""
+        current = p
+        inside_root = root is not None and (current == root or root in current.parents)
+        boundary = root if inside_root else Path(current.anchor)
+        while True:
+            if current == boundary:
+                return None
+            if self.is_symlink(current):
+                return current
+            parent = current.parent
+            if parent == current:
+                return None
+            current = parent
+
     def is_dir(self, p: Path) -> bool:
         import stat as _s
         st = self._stat(p)

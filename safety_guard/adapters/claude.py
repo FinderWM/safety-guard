@@ -5,6 +5,7 @@ import json
 from typing import Any
 
 from ..contracts import DecisionResult, NormalizedRequest, Operation
+from .base import AdapterCapabilities, project_decision, unknown_request
 from . import fields
 
 
@@ -33,6 +34,7 @@ def _audit_input(tool: str, raw_input: dict[str, Any]) -> str:
 
 class ClaudeAdapter:
     name = "claude"
+    capabilities = AdapterCapabilities(supports_ask=True)
 
     def parse(self, stdin_json: dict[str, Any]) -> NormalizedRequest | None:
         event = fields.event_name(stdin_json)
@@ -40,8 +42,17 @@ class ClaudeAdapter:
             return None
 
         tool = fields.tool_name(stdin_json)
+        if tool is None:
+            raise ValueError("missing tool_name")
         if tool not in _SUPPORTED_TOOLS:
-            raise ValueError(f"unsupported Claude tool: {tool!r}")
+            raw_input = fields.safe_tool_input(stdin_json)
+            return unknown_request(
+                adapter=self.name,
+                event=_EVENT,
+                tool=tool,
+                cwd=fields.cwd(stdin_json),
+                raw_input=raw_input,
+            )
 
         raw_input = fields.tool_input(stdin_json)
         cwd = fields.cwd(stdin_json)
@@ -63,15 +74,17 @@ class ClaudeAdapter:
             operations=(operation,),
             cwd=cwd,
             audit_input=audit,
+            provenance=("adapter:claude",),
         )
 
     def render(self, result: DecisionResult) -> dict[str, Any]:
-        if result.decision == "allow":
+        decision = project_decision(result, self.capabilities)
+        if decision in ("allow", "abstain"):
             return {}
         output: dict[str, Any] = {
             "hookSpecificOutput": {
                 "hookEventName": _EVENT,
-                "permissionDecision": result.decision,
+                "permissionDecision": decision,
             }
         }
         if result.reason:

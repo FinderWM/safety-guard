@@ -37,15 +37,14 @@ def test_pascal_event_still_works(grok, cwd: Path):
     assert "bash-rm-root-or-home" in out["reason"]
 
 
-def test_medium_ask_promoted_to_deny(grok, cwd: Path):
+def test_medium_ask_projects_to_platform_allow(grok, cwd: Path):
     out = grok("run_terminal_command", {"command": "rm -rf ./tmp-dir"}, cwd)
-    assert out["decision"] == "deny"
-    assert "bash-rm-targeted" in out["reason"]
+    assert out == {}
 
 
 def test_allow_benign_command(grok, cwd: Path):
     out = grok("run_terminal_command", {"command": "git status"}, cwd)
-    assert out == {"decision": "allow"}
+    assert out == {}
 
 
 def test_search_replace_create_maps_to_write_allow(grok, cwd: Path):
@@ -55,10 +54,10 @@ def test_search_replace_create_maps_to_write_allow(grok, cwd: Path):
         {"file_path": str(target), "old_string": "", "new_string": "hi"},
         cwd,
     )
-    assert out == {"decision": "allow"}
+    assert out == {}
 
 
-def test_search_replace_overwrite_existing_denied(grok, cwd: Path):
+def test_search_replace_overwrite_existing_projects_to_allow(grok, cwd: Path):
     target = cwd / "existing.txt"
     target.write_text("old")
     out = grok(
@@ -66,22 +65,20 @@ def test_search_replace_overwrite_existing_denied(grok, cwd: Path):
         {"file_path": str(target), "old_string": "", "new_string": "new"},
         cwd,
     )
-    assert out["decision"] == "deny"
-    assert "file-overwrite-existing" in out["reason"]
+    assert out == {}
 
 
-def test_search_replace_edit_outside_cwd_denied(grok, cwd: Path):
+def test_search_replace_edit_outside_cwd_projects_to_allow(grok, cwd: Path):
     out = grok(
         "search_replace",
         {
-            "file_path": "/etc/hosts",
+            "file_path": "/nonexistent-probe/etc/hosts",
             "old_string": "127.0.0.1",
             "new_string": "x",
         },
         cwd,
     )
-    assert out["decision"] == "deny"
-    assert "file-outside-cwd" in out["reason"]
+    assert out == {}
 
 
 def test_search_replace_edit_inside_cwd_allow(grok, cwd: Path):
@@ -92,7 +89,7 @@ def test_search_replace_edit_inside_cwd_allow(grok, cwd: Path):
         {"file_path": str(target), "old_string": "hi", "new_string": "yo"},
         cwd,
     )
-    assert out == {"decision": "allow"}
+    assert out == {}
 
 
 def test_target_file_alias_accepted(grok, cwd: Path):
@@ -102,7 +99,7 @@ def test_target_file_alias_accepted(grok, cwd: Path):
         {"target_file": str(target), "old_string": "", "new_string": "z"},
         cwd,
     )
-    assert out == {"decision": "allow"}
+    assert out == {}
 
 
 def test_unrelated_event_ignored(grok, cwd: Path):
@@ -115,23 +112,21 @@ def test_unrelated_event_ignored(grok, cwd: Path):
     assert out == {}
 
 
-def test_unsupported_tool_fails_closed(grok, cwd: Path):
+def test_unknown_tool_uses_default_allow(grok, cwd: Path):
     out = grok("spawn_subagent", {"prompt": "x", "description": "x"}, cwd)
-    assert out["decision"] == "deny"
-    assert "unsupported Grok tool" in out["reason"]
+    assert out == {}
 
 
 def test_read_file_inside_cwd_allow(grok, cwd: Path):
     target = cwd / "a.txt"
     target.write_text("hi")
     out = grok("read_file", {"target_file": str(target)}, cwd)
-    assert out == {"decision": "allow"}
+    assert out == {}
 
 
-def test_read_file_outside_cwd_denied(grok, cwd: Path):
+def test_read_file_outside_cwd_projects_to_allow(grok, cwd: Path):
     out = grok("read_file", {"target_file": "/nonexistent-probe/hosts"}, cwd)
-    assert out["decision"] == "deny"
-    assert "file-outside-cwd" in out["reason"]
+    assert out == {}
 
 
 def test_malformed_tool_input_fails_closed(cwd: Path):
@@ -157,15 +152,14 @@ def test_malformed_tool_input_fails_closed(cwd: Path):
 def test_native_write_lowercase_create_allow(grok, cwd: Path):
     target = cwd / "from-write.txt"
     out = grok("write", {"file_path": str(target), "content": "hi"}, cwd)
-    assert out == {"decision": "allow"}
+    assert out == {}
 
 
-def test_native_write_lowercase_overwrite_denied(grok, cwd: Path):
+def test_native_write_lowercase_overwrite_projects_to_allow(grok, cwd: Path):
     target = cwd / "exists.txt"
     target.write_text("old")
     out = grok("write", {"file_path": str(target), "content": "new"}, cwd)
-    assert out["decision"] == "deny"
-    assert "file-overwrite-existing" in out["reason"]
+    assert out == {}
 
 
 def test_edit_dot_grok_config_denied(grok, cwd: Path):
@@ -185,5 +179,4 @@ def test_edit_dot_grok_config_denied(grok, cwd: Path):
 
 def test_read_dot_grok_zone_allowed(grok, cwd: Path):
     out = grok("run_terminal_command", {"command": "ls ~/.grok"}, cwd)
-    assert out == {"decision": "allow"}
-
+    assert out == {}

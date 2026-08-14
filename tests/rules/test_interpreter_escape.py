@@ -33,9 +33,12 @@ ESCAPES = [
 
 
 @pytest.mark.parametrize("cmd", ESCAPES)
-def test_shell_escape_denied(bash, cwd: Path, cmd: str):
+def test_shell_escape_requires_review(bash, cwd: Path, cmd: str):
     decision, reason = bash(cmd, cwd)
-    assert decision == "deny", f"{cmd!r} 应 deny，实际 {decision} ({reason})"
+    # 固定 argv 的 subprocess 调用仍会执行外部命令，但属于可审查的 medium
+    # 风险；其它把控制权交给 shell 的形态保持 deny。
+    expected = "ask" if "subprocess.run(['id'])" in cmd else "deny"
+    assert decision == expected, f"{cmd!r} 应 {expected}，实际 {decision} ({reason})"
     assert RULE in (reason or ""), f"{cmd!r} 未命中逃逸判定：{reason}"
 
 

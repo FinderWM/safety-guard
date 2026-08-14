@@ -6,11 +6,12 @@ import sys
 from typing import Any
 
 from . import audit, engine
-from .adapters.base import Adapter
+from .adapters.base import Adapter, safe_tool_label
 from .adapters import fields
 from .adapters.registry import select
 from .config import Config, load as load_config
 from .contracts import DecisionResult, NormalizedRequest
+from .reviewer import Reviewer
 
 # 各平台 PreToolUse 族事件：adapter 未认领时不应静默放行（否则错 adapter 会放行 rm -rf /）。
 _PRETOOL_EVENTS = frozenset({
@@ -30,19 +31,30 @@ def _looks_like_pretool(stdin_json: dict[str, Any]) -> bool:
 
 
 def _internal_result(reason: str, cfg: Config) -> DecisionResult:
+    if cfg.dry_run:
+        return DecisionResult(
+            "allow",
+            reason,
+            engine_decision="deny",
+            error_type="internal",
+            error_detail=reason,
+            decision_source="internal",
+        )
     if cfg.fail_open:
-        return DecisionResult("allow", engine_decision="allow")
+        return DecisionResult("allow", engine_decision="allow", decision_source="internal")
     return DecisionResult(
         "deny",
         f"[INTERNAL:safety-guard] {reason}",
         engine_decision="deny",
         error_type="internal",
         error_detail=reason,
+        decision_source="internal",
     )
 
 
 def _tool_name(stdin_json: dict[str, Any]) -> str:
-    return fields.tool_name(stdin_json) or ""
+    raw = fields.tool_name(stdin_json)
+    return safe_tool_label(raw) if raw is not None else "unknown"
 
 
 def _cwd(stdin_json: dict[str, Any]) -> str:
@@ -81,6 +93,8 @@ def _emit_audit(
     cwd: str,
     raw_input: str,
     hook_event: str | None = None,
+    classification: str | None = None,
+    review: dict[str, Any] | None = None,
 ) -> None:
     try:
         audit.record_evaluation(
@@ -95,6 +109,8 @@ def _emit_audit(
             hook_event=hook_event,
             error_type=result.error_type,
             error_detail=result.error_detail,
+            classification=classification,
+            review=review,
         )
     except Exception:
         pass
@@ -105,6 +121,7 @@ def run(
     *,
     adapter: Adapter | None = None,
     config: Config | None = None,
+    reviewer: Reviewer | None = None,
 ) -> dict[str, Any]:
     """执行一次 Hook 请求并返回目标平台的原生输出。"""
     selected = adapter or select()
@@ -123,6 +140,7 @@ def run(
             cwd=_cwd(stdin_json),
             raw_input=_audit_raw(stdin_json),
             hook_event=fields.event_name(stdin_json),
+            classification="unknown",
         )
         return output
     if request is None:
@@ -147,7 +165,7 @@ def run(
             return output
         return {}
 
-    result = engine.evaluate(request, cfg)
+    result = engine.evaluate(request, cfg, reviewer=reviewer)
     output = selected.render(result)
     _emit_audit(
         cfg=cfg,
@@ -158,6 +176,8 @@ def run(
         cwd=request.cwd,
         raw_input=request.audit_input,
         hook_event=request.event,
+        classification=request.classification,
+        review=result.review,
     )
     return output
 

@@ -13,18 +13,12 @@ git 自己的全局选项。
 from __future__ import annotations
 
 from ..context import BashContext
+from ..helpers import git_subcommand_args
 from .base import Rule, RuleMatch
 from .registry import register
 
 
 # 吃一个独立值的全局选项（`git -C <dir>` / `git -c key=val`）
-_GIT_VALUE_OPTS = frozenset({
-    "-C", "-c",
-    "--git-dir", "--work-tree", "--namespace",
-    "--super-prefix", "--config-env",
-})
-
-
 def _subcommand_args(args: list[str]) -> list[str]:
     """跳过 git 全局选项，返回「子命令 + 其子参数」切片。
 
@@ -33,23 +27,8 @@ def _subcommand_args(args: list[str]) -> list[str]:
       --git-dir=PATH               等号写法
       --git-dir PATH               长选项分离写法
     """
-    i = 0
-    n = len(args)
-    while i < n:
-        a = args[i]
-        if a in _GIT_VALUE_OPTS:
-            i += 2
-            continue
-        if a.startswith("--") and "=" in a:
-            # --git-dir=/x  / --work-tree=/x  / --namespace=x
-            i += 1
-            continue
-        if a.startswith("-") and a != "-":
-            # 其它短/长全局开关（-p/--paginate 等），无值
-            i += 1
-            continue
-        break
-    return args[i:]
+    subcommand, sub_args = git_subcommand_args(args)
+    return [subcommand, *sub_args] if subcommand is not None else []
 
 
 def _detect(args: list[str]) -> str | None:
@@ -62,6 +41,15 @@ def _detect(args: list[str]) -> str | None:
     if sub == "reset" and ("--hard" in rest or "-H" in rest):
         return "reset --hard 将丢弃工作区和暂存区改动"
     if sub == "clean":
+        for option in rest:
+            if option == "--":
+                break
+            if option == "--dry-run" or (
+                option.startswith("-")
+                and not option.startswith("--")
+                and "n" in option[1:]
+            ):
+                return None
         for a in rest:
             if a.startswith("-") and "f" in a:
                 return "clean 将删除未跟踪文件（含 .gitignore 内文件，若带 -x）"
@@ -91,7 +79,10 @@ class BashGitDestructive(Rule):
     id = "bash-git-destructive"
     severity = "medium"
     applies_to = ("Bash",)
-    description = "git 的破坏性子命令（reset --hard / clean -f / branch -D / stash drop / worktree remove / rebase / restore / checkout --）"
+    description = (
+        "git 的破坏性子命令（reset --hard / clean -f / branch -D / stash drop / "
+        "worktree remove / rebase / restore / checkout --）"
+    )
 
     def match(self, ctx: BashContext) -> RuleMatch | None:
         if ctx.ast is None:

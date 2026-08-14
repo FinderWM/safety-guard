@@ -11,6 +11,7 @@ from __future__ import annotations
 from ..context import BashContext
 from ..helpers import (
     SCRIPT_RUNNERS,
+    deno_bun_run_program_index,
     looks_like_potentially_outside_path,
     normalize_cmd_name,
     word_display,
@@ -29,8 +30,10 @@ def _script_path_args(cmd) -> list:
     """跳过选项后的位置参数（脚本路径通常是第一个）。"""
     name = normalize_cmd_name(cmd.name or "")
     args = list(cmd.args)
-    if name in ("deno", "bun") and args and args[0].raw == "run":
-        args = args[1:]
+    if name in ("deno", "bun"):
+        raw_args = [getattr(arg, "raw", str(arg)) for arg in args]
+        program_index = deno_bun_run_program_index(name, raw_args)
+        return [args[program_index]] if program_index is not None else []
     i = 0
     while i < len(args):
         raw = args[i].raw

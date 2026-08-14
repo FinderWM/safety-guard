@@ -4,7 +4,7 @@
 
 它不是 OS sandbox，也不替代人工审查。目标是把「误删家目录 / force-push main / 管道执行远端脚本 / 改掉 hook 自身」等高代价失误，在 Hook 层挡下来或强制二次确认。
 
-当前内置 **Claude Code**、**Codex** 与 **Grok** 适配器，**38** 条规则、同一套引擎。
+当前内置 **Claude Code**、**Codex** 与 **Grok** 适配器，**43** 条规则、同一套引擎。
 
 ## 它做什么
 
@@ -13,6 +13,7 @@
 | `allow` | 放行 |
 | `ask` | 需要用户确认（medium） |
 | `deny` | 直接拒绝（high） |
+| `abstain` | 当前审查器不做决定，交还平台原生权限流程 |
 
 典型拦截面：
 
@@ -22,15 +23,16 @@
 - **环境颠覆**：`PATH=` / `LD_PRELOAD=` / `BASH_ENV=` 前缀赋值
 - **越界读写**：CWD 外路径（含 `read_file` / `Read` / `grep`）；`~/.claude` / `~/.agents` 等指令区写入需确认
 - **整文件覆盖 / 删格**：`Write` 覆盖已有文件、`NotebookEdit delete`、`apply_patch` 删除
-- **外部上传**：拒绝 Chrome DevTools MCP 把本机文件上传到无法由本地规则验证的页面
+- **外部上传**：工作区普通文件要求确认；敏感文件、CWD 外文件或 symlink 外传直接拒绝
 - **自保**：拒绝改写 safety-guard 入口、包目录及配置中的 `critical_paths`
-- **不可解释即标记**：路径槽静态算不清、内联/占位脚本运行时才成形 → ask，不静默放行
+- **已建模但不可解释即标记**：路径槽静态算不清、内联/占位脚本运行时才成形 → medium/ask；动态执行覆盖仍 high/deny
+- **未知工具先审查**：进入可插拔 reviewer；默认 `noop` 返回 `abstain`，不新增拦截
 - **包装不降级**：`rtk rm -rf /`、`sudo env FOO=1 rm …` 与裸命令同级拦截
 
 ## 工作原理（一句话）
 
 ```text
-平台 Hook JSON → Adapter.parse → Operation(s) → Engine + 规则 → Decision → Adapter.render → 平台 JSON
+平台 Hook JSON → Adapter.parse → 已建模 Operation(s) / 未知 reviewer → Engine → Adapter.render → 平台 JSON
 ```
 
 平台协议只活在 Adapter 里；规则只吃规范化 `Context`。Codex 的一次 `apply_patch` 或带多个本机路径的 MCP 调用会拆成多个 Operation，由同一引擎聚合决策。
@@ -42,9 +44,9 @@
 | Adapter | 事件 | 工具 |
 | --- | --- | --- |
 | `claude`（默认） | Claude Code `PreToolUse` | `Bash` / `Write` / `Edit` / `NotebookEdit` / `Read` / `Grep` / `Glob` |
-| `codex-pretool` | Codex `PreToolUse` | `Bash`/`shell`、`apply_patch`、`Edit`、`Write`、当前 Chrome DevTools MCP 本机路径工具 |
+| `codex-pretool` | Codex `PreToolUse` | `Bash`/`shell`、`apply_patch`、`Edit`、`Write`、`Read`、`view_image`、当前 Chrome DevTools MCP 及未知本地工具入口 |
 | `codex-permission` | Codex `PermissionRequest` | 同上 |
-| `grok` | Grok `pre_tool_use` / `PreToolUse` | `run_terminal_command`、`write`、`search_replace`、`read_file`、`list_dir`、`grep`（及 Bash/Write/Edit/Read 别名） |
+| `grok` | Grok `PreToolUse`（兼容 `pre_tool_use`） | `run_terminal_command`、`write`、`search_replace`、`read_file`、`list_dir`、`grep`（及 Bash/Write/Edit/Read 别名） |
 
 选择优先级：`--adapter` 参数 → 环境变量 `SAFETY_GUARD_ADAPTER` → 默认 `claude`。
 
@@ -67,13 +69,21 @@ pip install bashlex pytest
 ```text
 safety-guard/
 ├── safety-guard.py
-├── safety_guard.toml
+├── safety_guard.toml.example
 ├── safety_guard/
 ├── tests/
 ├── tools/
 ├── GUIDE.md
 └── README.md
 ```
+
+复制示例生成本机配置；实际 `safety_guard.toml` 已被 Git 忽略：
+
+```bash
+cp safety_guard.toml.example safety_guard.toml
+```
+
+不创建配置文件时，程序使用 `safety_guard/config.py` 中的安全默认值。
 
 ### 接入 Claude Code
 
@@ -84,7 +94,7 @@ safety-guard/
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "Bash|Write|Edit|NotebookEdit|Read|Grep|Glob",
+        "matcher": "*",
         "hooks": [
           {
             "type": "command",
@@ -103,13 +113,13 @@ safety-guard/
 
 ```toml
 [[hooks.PreToolUse]]
-matcher = "^(Bash|apply_patch|Edit|Write|mcp__chrome_devtools__(evaluate_script|get_network_request|lighthouse_audit|performance_start_trace|performance_stop_trace|take_heapsnapshot|take_screenshot|take_snapshot|upload_file))$"
+matcher = ".*"
 hooks = [
   { type = "command", command = "python3 /path/to/safety-guard/safety-guard.py --adapter codex-pretool" },
 ]
 
 [[hooks.PermissionRequest]]
-matcher = "^(Bash|apply_patch|Edit|Write|mcp__chrome_devtools__(evaluate_script|get_network_request|lighthouse_audit|performance_start_trace|performance_stop_trace|take_heapsnapshot|take_screenshot|take_snapshot|upload_file))$"
+matcher = ".*"
 hooks = [
   { type = "command", command = "python3 /path/to/safety-guard/safety-guard.py --adapter codex-permission" },
 ]
@@ -117,25 +127,35 @@ hooks = [
 
 不要用全局 `SAFETY_GUARD_ADAPTER` 替代命令行参数；两个 Hook 的事件协议不同，显式参数不会影响 Claude 或 Grok Adapter。
 
-Chrome DevTools MCP 的普通浏览器操作不涉及本机路径，不进入当前 matcher；截图、trace、network body 等显式输出路径复用文件写入规则；`upload_file` 会因外部数据传输被拒绝。Adapter 直接收到未知工具时使用空 Operation 放行，并保留归一化审计入口，供以后接入独立的未知行为检测方案。
+`matcher = ".*"` 让 Codex 当前支持的所有本地函数工具先经过 Adapter。截图、trace、network body 等显式输出路径复用文件写入规则；`upload_file` 根据路径位置和敏感性生成 ask/deny。无本机路径的已知工具直接继续，未知工具进入 reviewer，默认 `noop` 只返回 `abstain`。
 
-matcher 不使用 `mcp__chrome_devtools__.*` 通配符。使用 `chrome-devtools-mcp@latest` 出现新工具时，未知工具保持平台默认行为；确认其 schema 包含本机路径后，再同时扩展 Adapter 与 matcher。
+Codex `PreToolUse` 目前不支持 `ask`：medium 结果不升级为 deny，而是保持无决定；`PermissionRequest` 的无决定结果继续显示 Codex 原生审批。只有 reviewer 明确返回 allow 时，`codex-permission` 才会跳过原生审批。
 
 修改 Hook 定义后，在 Codex 中运行 `/hooks` 并重新信任变更；不要手动修改 `[hooks.state]` 的信任哈希。
 
 ### 接入 Grok
 
-在 `~/.grok/config.toml`（或 `~/.grok/hooks/*.json`）注册 `PreToolUse`，**必须**指定 `--adapter grok`（默认 `claude` 认不出 Grok 的事件名/工具名，会静默放行）：
+在 `~/.grok/hooks/safety-guard.json` 注册 `PreToolUse`，**必须**指定 `--adapter grok`。省略 matcher 会覆盖全部工具，使未知工具也能进入 reviewer：
 
-```toml
-[[hooks.PreToolUse]]
-matcher = "Bash|Write|write|Edit|run_terminal_command|search_replace|read_file|list_dir|grep"
-hooks = [
-  { type = "command", command = "python3 /path/to/safety-guard/safety-guard.py --adapter grok", timeout = 10 },
-]
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 /path/to/safety-guard/safety-guard.py --adapter grok",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}
 ```
 
-Grok 侧 `ask`（medium）会升为顶层 `{"decision":"deny","reason":"..."}`，因为 PreToolUse 没有 Claude 式确认 UI。
+Grok 只有显式 `{"decision":"deny"}` 会阻断。high 输出 deny；allow、medium ask 与默认 unknown abstain 均保持空输出，由 Grok 原生权限模式继续处理。
 
 ### 立刻试一次
 
@@ -151,7 +171,10 @@ python3 safety-guard.py --explain --tool Write --path ./README.md
 
 ## 配置
 
-运行时读安装根目录的 `safety_guard.toml`（或 `SAFETY_GUARD_CONFIG` 指向的文件）。修改后**无需重启** CLI，下次 Hook 调用重新加载。
+运行时读安装根目录下由使用者创建的 `safety_guard.toml`（或
+`SAFETY_GUARD_CONFIG` 指向的文件）。仓库只提交
+`safety_guard.toml.example`；没有实际配置文件时使用代码中的安全默认值。修改后
+**无需重启** CLI，下次 Hook 调用重新加载。
 
 常用项：
 
@@ -166,6 +189,8 @@ python3 safety-guard.py --explain --tool Write --path ./README.md
 | `wrapper_specs.<name>` | 包装怎么剥：`value_opts` / `skip_positional` / `subcommands` |
 | `critical_paths` | 高危路径（**与默认自保合并**，不会丢掉入口脚本保护） |
 | `fail_open` / `dry_run` | 异常放行 / 只审计不拦截 |
+| `unknown_reviewer` / `reviewer_timeout_ms` | 未知工具 reviewer 名称与超时；默认 `noop` / 250ms |
+| `audit_include_body` | 是否把脱敏后的正文写入审计；默认 false |
 | `audit_*` | 审计目录与保留策略 |
 
 配置读取或解析失败时，会回退到 fail-closed 默认值，仍保护 Claude、Codex、Grok 的控制文件；审计只记录 `config_load_error` 类型，不记录底层异常详情。
@@ -177,11 +202,14 @@ python3 safety-guard.py --explain --tool Write --path ./README.md
 | `SAFETY_GUARD_ADAPTER` | 选择 Adapter |
 | `SAFETY_GUARD_CONFIG` | 指定配置文件 |
 | `SAFETY_GUARD_FAIL_OPEN=1` | 内部异常/解析失败时放行（默认 fail-closed） |
-| `SAFETY_GUARD_DRY_RUN=1` | 始终 allow，但仍写审计 |
+| `SAFETY_GUARD_DRY_RUN=1` | 本 Hook 不输出阻断，但仍写审计；原生权限流程保留 |
+| `SAFETY_GUARD_AUDIT_INCLUDE_BODY=1` | 显式允许审计写入脱敏后的输入正文 |
 | `SAFETY_GUARD_NO_AUDIT=1` | 不写审计（测试/回放） |
 | `SAFETY_GUARD_IGNORE_DISABLED_RULES=1` | 忽略 `disabled_rules` |
 
-审计默认写在安装目录下 `audit/audit-YYYY-MM-DD.jsonl`，目录权限为 `0700`、日志文件权限为 `0600`。常见 API key、token、密码赋值、认证头和 JSON 凭据字段会脱敏，但这只是补救措施，不应把真实凭据传给工具命令；**上传仓库前请勿提交真实审计**（含本机路径与历史命令）。
+审计默认写在安装目录下 `audit/audit-YYYY-MM-DD.jsonl`，目录权限为 `0700`、日志文件权限为 `0600`。默认只保存 digest、字符数、行数、规则 id/severity 与决策，不保存命令、补丁、正文或 match 详情。只有显式启用 `audit_include_body` 才写脱敏正文；**不要提交真实审计**。
+
+`rendered_decision=abstain` 表示 Adapter 没有向平台输出显式决策。Claude/Codex 的策略 allow 不会替代原生权限流程；Grok 协议则把退出 0 且无输出视为 allow。
 
 ## 调试与回归
 
@@ -192,7 +220,7 @@ python3 safety-guard.py --regression    # fixtures/regression_commands.txt
 python3 -m pytest -q
 SAFETY_GUARD_IGNORE_DISABLED_RULES=1 python3 safety-guard.py --regression
 
-# 用真实审计做改规则前后对比（可选）
+# 仅在审计已显式保存正文时才能做精确回放（可选）
 python3 tools/replay.py --save /tmp/before.json
 python3 tools/replay.py --compare /tmp/before.json
 ```
@@ -200,17 +228,17 @@ python3 tools/replay.py --compare /tmp/before.json
 ## 设计原则
 
 1. **静态分析**，不是容器/权限沙箱。
-2. **不可解释 ⇒ 标记，不静默 allow**。
+2. **只检测已建模行为**：未知工具进入 reviewer，默认 abstain，不由当前规则集拦截。
 3. **包装不降低防护等级**（`rtk`/`sudo`/`env` 等价于内层命令）。
 4. **Adapter 与 Engine 解耦**：新平台优先加 Adapter，不改规则引擎。
-5. **默认 fail-closed**：Bash 解析失败、规则崩溃 → deny（可用环境变量临时打开）。
+5. **已建模输入默认 fail-closed**：Bash 解析失败、规则崩溃 → deny（可用环境变量临时打开）。
 6. **自保优先**：`critical_paths` 默认包含入口脚本与包目录，避免 hook 被自己改坏后无法修复。
 
 ## 项目结构
 
 ```text
 safety-guard.py       # Hook stdin + 调试 CLI 统一入口
-safety_guard.toml     # 配置
+safety_guard.toml.example # 配置示例；复制为被忽略的 safety_guard.toml
 safety_guard/         # 引擎、Adapter、规则、bash 分析栈
 tests/                # 单元 / 规则 / Codex 协议测试
 tools/replay.py       # 审计回放

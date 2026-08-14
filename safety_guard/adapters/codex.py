@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from ..contracts import DecisionResult, NormalizedRequest, Operation
+from .base import AdapterCapabilities, project_decision, unknown_request
 from . import fields
 
 
@@ -20,8 +21,10 @@ _TOOL_MAP = {
     # 这些别名兼容旧载荷和手工回放。
     "Edit": "Edit",
     "Write": "Write",
+    "Read": "Read",
+    "view_image": "Read",
 }
-_FILE_TOOLS = frozenset({"Edit", "Write"})
+_FILE_TOOLS = frozenset({"Edit", "Write", "Read"})
 _PATCH_BEGIN = "*** Begin Patch"
 _PATCH_END = "*** End Patch"
 _PATCH_OP_RE = re.compile(r"^\*\*\* (Add|Delete|Update) File: (.+)$")
@@ -115,6 +118,15 @@ _MCP_NO_PATH_TOOLS = frozenset({
     "mcp__chrome_devtools__type_text",
     "mcp__chrome_devtools__wait_for",
 })
+
+# Codex 支持本地函数工具，未知工具必须先进入统一 reviewer 入口；未知结果默认
+# abstain，由 Codex 自己决定是否需要审批。规则 adapter 只对有明确 schema 的工具建模。
+CODEX_HOOK_MATCHER = r".*"
+
+
+def codex_hook_matcher() -> str:
+    """返回应同时用于 PreToolUse/PermissionRequest 的 matcher。"""
+    return CODEX_HOOK_MATCHER
 
 
 def _clean_path(raw: str) -> str:
@@ -257,29 +269,14 @@ def _mcp_path_operation(
     return tuple(operations), " | ".join(audit_paths) if audit_paths else raw_tool
 
 
-def _unknown_request(
-    *,
-    adapter: str,
-    event: str,
-    raw_tool: str | None,
-    cwd: str,
-) -> NormalizedRequest:
-    """保留未知工具检测入口；当前策略只审计归一化结果，不拦截。"""
-    tool = raw_tool if isinstance(raw_tool, str) and raw_tool else "unknown"
-    return NormalizedRequest(
-        adapter=adapter,
-        event=event,
-        tool=tool,
-        operations=(),
-        cwd=cwd,
-        audit_input=tool,
-    )
-
-
 @dataclass(frozen=True)
 class CodexAdapter:
     name: str
     event: Literal["PreToolUse", "PermissionRequest"]
+
+    @property
+    def capabilities(self) -> AdapterCapabilities:
+        return AdapterCapabilities(supports_ask=False)
 
     def parse(self, stdin_json: dict[str, Any]) -> NormalizedRequest | None:
         event = fields.event_name(stdin_json)
@@ -287,14 +284,17 @@ class CodexAdapter:
             return None
 
         raw_tool = fields.tool_name(stdin_json)
+        if raw_tool is None:
+            raise ValueError("missing tool_name")
         cwd = fields.cwd(stdin_json)
 
         if raw_tool not in _MCP_PATH_TOOLS and raw_tool not in _MCP_NO_PATH_TOOLS and raw_tool not in _TOOL_MAP:
-            return _unknown_request(
+            return unknown_request(
                 adapter=self.name,
                 event=self.event,
-                raw_tool=raw_tool,
+                tool=raw_tool,
                 cwd=cwd,
+                raw_input=fields.safe_tool_input(stdin_json),
             )
 
         raw_input = fields.tool_input(stdin_json)
@@ -302,13 +302,16 @@ class CodexAdapter:
         if raw_tool in _MCP_PATH_TOOLS:
             operations, audit_input = _mcp_path_operation(raw_tool, raw_input)
             tool = raw_tool
+            classification = "modeled"
         elif raw_tool in _MCP_NO_PATH_TOOLS:
             operations = ()
             audit_input = raw_tool
             tool = raw_tool
+            classification = "known-noop"
         else:
             tool = _TOOL_MAP.get(raw_tool)
             assert tool is not None
+            classification = "modeled"
 
         if tool == "Bash":
             command = raw_input.get("command") or raw_input.get("cmd") or ""
@@ -327,6 +330,7 @@ class CodexAdapter:
                 raise ValueError("patch must be a string")
             operations = _patch_operations(parse_apply_patch(patch_text))
             audit_input = patch_text
+            classification = "modeled" if operations else "known-noop"
 
         return NormalizedRequest(
             adapter=self.name,
@@ -335,12 +339,30 @@ class CodexAdapter:
             operations=operations,
             cwd=cwd,
             audit_input=audit_input,
+            classification=classification,
+            provenance=(f"adapter:{self.name}",),
         )
 
     def render(self, result: DecisionResult) -> dict[str, Any]:
-        # Codex PreToolUse/PermissionRequest 均无可靠的「ask 再确认」闸门可依赖：
-        # medium 若只回 systemMessage 会被静默放行。与 Grok 对齐：ask 升 deny。
-        if result.decision == "allow":
+        # Codex PreToolUse 不支持 ask；PermissionRequest 的空对象表示交给原生审批。
+        # 未命中规则不等于获得授权；PermissionRequest 也必须保留 Codex 原生审批。
+        decision = project_decision(result, self.capabilities)
+        if decision == "abstain":
+            return {}
+        if decision == "allow":
+            # 只有显式 reviewer allow 才跳过 PermissionRequest 原生审批；策略层的
+            # allow 仍保持空输出，避免安全规则变成平台授权替代品。
+            if (
+                self.event == _PERMISSION_EVENT
+                and result.decision_source == "reviewer"
+                and result.resolved_engine_decision() == "allow"
+            ):
+                return {
+                    "hookSpecificOutput": {
+                        "hookEventName": _PERMISSION_EVENT,
+                        "decision": {"behavior": "allow"},
+                    }
+                }
             return {}
         if self.event == _PRETOOL_EVENT:
             output: dict[str, Any] = {

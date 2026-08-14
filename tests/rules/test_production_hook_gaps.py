@@ -14,15 +14,26 @@ from dataclasses import replace
 PROBE = "/nonexistent-probe/secret"
 
 
-def test_path_extension_allows(bash, cwd: Path):
+def test_path_extension_keeps_safe_forms_and_asks_external_lookup(bash, cwd: Path):
     for cmd in (
         'PATH="$PATH" git status',
         'PATH="./node_modules/.bin:$PATH" true',
         'export PATH="/usr/local/bin:$PATH"',
-        'env PATH="/opt/bin:$PATH" ls',
     ):
         decision, reason = bash(cmd, cwd)
         assert decision == "allow", f"{cmd!r} -> {decision} ({reason})"
+
+    decision, reason = bash('env PATH="/opt/bin:$PATH" ls', cwd)
+    assert decision == "ask"
+    assert "bash-env-subversion" in (reason or "")
+
+    for cmd in (
+        'PATH="./node_modules/.bin:$PATH" npm --version',
+        'PATH="$HOME/.local/bin:$PATH" python3 --version',
+    ):
+        decision, reason = bash(cmd, cwd)
+        assert decision == "ask", f"{cmd!r} -> {decision} ({reason})"
+        assert "bash-env-subversion" in (reason or "")
 
 
 def test_path_replace_still_denies(bash, cwd: Path):
@@ -119,7 +130,7 @@ def test_interpreter_read_literal_not_write(bash, cwd: Path):
     assert "bash-interpreter-write" not in (reason or "")
 
 
-def test_grok_read_file_outside_denied(cwd: Path):
+def test_grok_read_file_outside_projects_to_allow(cwd: Path):
     out = runner.run(
         {
             "hookEventName": "pre_tool_use",
@@ -130,8 +141,7 @@ def test_grok_read_file_outside_denied(cwd: Path):
         adapter=get("grok"),
         config=replace(load_config(), fail_open=False),
     )
-    assert out["decision"] == "deny"
-    assert "file-outside-cwd" in (out.get("reason") or "")
+    assert out == {}
 
 
 def test_grok_list_dir_and_grep_inside_allow(cwd: Path):
@@ -154,7 +164,7 @@ def test_grok_list_dir_and_grep_inside_allow(cwd: Path):
             adapter=adapter,
             config=cfg,
         )
-        assert out == {"decision": "allow"}, f"{tool} -> {out}"
+        assert out == {}, f"{tool} -> {out}"
 
 
 def test_grok_arguments_alias_catches_rm_root(cwd: Path):

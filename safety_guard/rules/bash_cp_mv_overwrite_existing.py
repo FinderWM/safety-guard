@@ -1,13 +1,40 @@
-"""bash-cp-mv-overwrite-existing：cp/mv 目标文件已存在。
-
-只在最后一个非选项参数为已存在文件时触发（最后一个 arg 是 destination）。
-"""
+"""bash-cp-mv-overwrite-existing：cp/mv 的实际目标文件已存在。"""
 from __future__ import annotations
 
 from ..context import BashContext
+from ..helpers import normalize_cmd_name, split_cp_mv_operands
 from ..paths import resolve
 from .base import Rule, RuleMatch
 from .registry import register
+
+
+def _path_text(value: object) -> str:
+    return str(getattr(value, "path_text", getattr(value, "raw", value)))
+
+
+def _has_no_clobber(args: list) -> bool:
+    """识别 `-n`/`--no-clobber`，且不把 `-t`/`-S` 的附着值当选项。"""
+    index = 0
+    while index < len(args):
+        raw = str(getattr(args[index], "raw", args[index]))
+        if raw == "--":
+            return False
+        if raw == "--no-clobber":
+            return True
+        if raw in {"-t", "--target-directory", "-S", "--suffix"}:
+            index += 2
+            continue
+        if raw.startswith(("--target-directory=", "--suffix=")):
+            index += 1
+            continue
+        if raw.startswith("-") and not raw.startswith("--") and raw != "-":
+            short = raw[1:]
+            value_positions = [pos for pos in (short.find("t"), short.find("S")) if pos >= 0]
+            option_letters = short[:min(value_positions)] if value_positions else short
+            if "n" in option_letters:
+                return True
+        index += 1
+    return False
 
 
 @register
@@ -21,23 +48,48 @@ class BashCpMvOverwriteExisting(Rule):
         if ctx.ast is None:
             return None
         for cmd in ctx.ast.commands:
-            if cmd.name not in ("cp", "mv"):
+            name = normalize_cmd_name(cmd.name or "")
+            if name not in ("cp", "mv"):
                 continue
-            non_opts = [w.raw for w in cmd.args if not w.raw.startswith("-")]
-            if len(non_opts) < 2:
+            args = list(cmd.args)
+            if _has_no_clobber(args):
                 continue
-            dest = non_opts[-1]
+            sources, destination, target_directory_mode = split_cp_mv_operands(args)
+            if destination is None:
+                continue
             try:
-                p = resolve(dest, ctx.policy)
+                target = resolve(_path_text(destination), ctx.policy)
             except Exception:
                 continue
-            if ctx.disk.is_dir(p):
-                continue  # 移入目录里不是覆盖语义
-            if ctx.disk.exists(p):
+            if target_directory_mode and not ctx.disk.is_dir(target):
+                continue
+            if target_directory_mode or ctx.disk.is_dir(target):
+                for source in sources:
+                    try:
+                        source_path = resolve(_path_text(source), ctx.policy)
+                    except Exception:
+                        continue
+                    basename = source_path.name
+                    if not basename or basename in (".", "..", "*"):
+                        continue
+                    nested = target / basename
+                    if ctx.disk.exists(nested) and not ctx.disk.is_dir(nested):
+                        return RuleMatch(
+                            rule_id=self.id,
+                            severity=self.severity,
+                            reason=f"{name} 目标目录 {target} 中的 {nested} 已存在，将被覆盖",
+                            extra={
+                                "target": str(nested),
+                                "cmd": name,
+                                "destination_directory": str(target),
+                            },
+                        )
+                continue
+            if ctx.disk.exists(target):
                 return RuleMatch(
                     rule_id=self.id,
                     severity=self.severity,
-                    reason=f"{cmd.name} 目标 {p} 已存在，将被覆盖",
-                    extra={"target": str(p), "cmd": cmd.name},
+                    reason=f"{name} 目标 {target} 已存在，将被覆盖",
+                    extra={"target": str(target), "cmd": name},
                 )
         return None

@@ -48,6 +48,7 @@ audit-*.jsonl
 .after.json
 
 # 本地配置覆盖（勿提交本机路径）
+safety_guard.toml
 safety_guard.local.toml
 settings.local.json
 

@@ -7,7 +7,6 @@ from __future__ import annotations
 
 from ..context import BashContext
 from ..helpers import (
-    SHELLS,
     is_net_fetcher_name,
     is_pipeline_exec_sink,
     normalize_cmd_name,
@@ -61,11 +60,9 @@ class BashPipeToShell(Rule):
                     ),
                     extra={"last": last_label},
                 )
-            # 模式 3：本地构造再喂 shell（printf|bash、echo|sh…）。
-            # 解释器终点仍靠 high 的 curl|python 与 interpreter-* 规则，避免
-            # `cat x | python3 -m json.tool` 之类日常管道被 medium 误伤。
-            sink_name = normalize_cmd_name(getattr(sink, "name", "") or "")
-            if soft is None and sink_name in SHELLS:
+            # 模式 3：本地构造直接作为 shell/解释器程序源（printf|bash、cat|python）。
+            # 带显式脚本、-c/-e 载荷或模块时，stdin 只是数据，不在这里泛化拦截。
+            if soft is None:
                 soft = RuleMatch(
                     rule_id=self.id,
                     severity="medium",

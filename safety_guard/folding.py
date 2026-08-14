@@ -93,6 +93,17 @@ def fold_command(cmd, env: dict[str, str], home: str) -> None:
         else:
             w.folded = _strip_quotes(w.raw)
 
+    # bashlex 将重定向目标挂在 command.redirects，不在 words 中；若不折叠，
+    # `F=existing; echo x > "$F"` 会退回字面 `$F` 并漏掉覆盖检查。
+    for redirect in getattr(cmd, "redirects", []) or []:
+        target = getattr(redirect, "target", None)
+        if target is None:
+            continue
+        if target.has_expansion:
+            target.folded = _fold_parts(target.source, target.base, target.parts, env, home)
+        else:
+            target.folded = _strip_quotes(target.raw)
+
     for a in getattr(cmd, "assignments", []) or []:
         if a.has_expansion:
             a.folded_value = _fold_parts(a.source, a.base, a.parts, env, home)

@@ -22,7 +22,9 @@ from .bash_ast import WrapperSpec
 
 _FAIL_OPEN_ENV = "SAFETY_GUARD_FAIL_OPEN"
 _DRY_RUN_ENV = "SAFETY_GUARD_DRY_RUN"
+_AUDIT_INCLUDE_BODY_ENV = "SAFETY_GUARD_AUDIT_INCLUDE_BODY"
 ConfigLoadError = Literal["config_read_error", "config_parse_error", "config_invalid"]
+_ALLOWED_SEVERITIES = frozenset({"medium", "high"})
 
 
 def _install_root() -> Path:
@@ -91,6 +93,9 @@ def _defaults() -> dict:
         ],
         "fail_open": False,
         "dry_run": False,
+        "audit_include_body": False,
+        "unknown_reviewer": "noop",
+        "reviewer_timeout_ms": 250,
         # audit 目录默认在安装根目录下，跟随 hook 一起迁移
         "audit_dir": str(_install_root() / "audit"),
         "audit_retention_days": 7,
@@ -109,6 +114,9 @@ class Config:
     critical_paths: tuple[Path, ...]
     fail_open: bool
     dry_run: bool
+    audit_include_body: bool
+    unknown_reviewer: str
+    reviewer_timeout_ms: int
     audit_dir: Path
     audit_retention_days: int
     audit_max_file_mb: int
@@ -121,6 +129,90 @@ class Config:
 
 def _expand_path(p: str) -> Path:
     return Path(os.path.expandvars(os.path.expanduser(p)))
+
+
+def _string_list(raw: dict, key: str) -> list[str]:
+    value = raw.get(key)
+    if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+        raise ValueError(f"{key} must be an array of strings")
+    return value
+
+
+def _bool_value(raw: dict, key: str) -> bool:
+    value = raw.get(key)
+    if not isinstance(value, bool):
+        raise ValueError(f"{key} must be a boolean")
+    return value
+
+
+def _int_value(raw: dict, key: str, *, minimum: int) -> int:
+    value = raw.get(key)
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+        raise ValueError(f"{key} must be an integer >= {minimum}")
+    return value
+
+
+def _severity_overrides(raw: dict) -> dict[str, str]:
+    value = raw.get("severity_overrides")
+    if not isinstance(value, dict):
+        raise ValueError("severity_overrides must be a table")
+    if any(
+        not isinstance(rule_id, str)
+        or not isinstance(severity, str)
+        or severity not in _ALLOWED_SEVERITIES
+        for rule_id, severity in value.items()
+    ):
+        raise ValueError("severity_overrides values must be medium or high")
+    return dict(value)
+
+
+def _validate_wrapper_specs(raw: dict) -> None:
+    specs = raw.get("wrapper_specs")
+    if not isinstance(specs, dict):
+        raise ValueError("wrapper_specs must be a table")
+    for name, spec in specs.items():
+        if not isinstance(name, str) or not name or not isinstance(spec, dict):
+            raise ValueError("wrapper_specs entries must be named tables")
+        for key in ("value_opts", "subcommands"):
+            value = spec.get(key)
+            if value is not None and (
+                not isinstance(value, list)
+                or any(not isinstance(item, str) for item in value)
+            ):
+                raise ValueError(f"wrapper_specs.{name}.{key} must be an array of strings")
+        skip = spec.get("skip_positional")
+        if skip is not None and (
+            isinstance(skip, bool)
+            or not isinstance(skip, int)
+            or skip < 0
+        ):
+            raise ValueError(f"wrapper_specs.{name}.skip_positional must be an integer >= 0")
+
+
+def _validate_raw(raw: dict) -> None:
+    for key in (
+        "disabled_rules",
+        "protected_branches",
+        "read_only_zones",
+        "read_only_commands",
+        "critical_paths",
+        "wrapper_commands",
+    ):
+        _string_list(raw, key)
+    _severity_overrides(raw)
+    _validate_wrapper_specs(raw)
+    for key in ("fail_open", "dry_run", "audit_include_body"):
+        _bool_value(raw, key)
+    reviewer = raw.get("unknown_reviewer")
+    if not isinstance(reviewer, str) or not reviewer.strip():
+        raise ValueError("unknown_reviewer must be a non-empty string")
+    audit_dir = raw.get("audit_dir")
+    if not isinstance(audit_dir, str) or not audit_dir.strip():
+        raise ValueError("audit_dir must be a non-empty string")
+    _int_value(raw, "reviewer_timeout_ms", minimum=1)
+    _int_value(raw, "audit_retention_days", minimum=0)
+    _int_value(raw, "audit_max_file_mb", minimum=1)
+    _int_value(raw, "audit_max_total_mb", minimum=1)
 
 
 def _minimal_config() -> Config:
@@ -143,6 +235,9 @@ def _minimal_config() -> Config:
         ),
         fail_open=False,
         dry_run=False,
+        audit_include_body=False,
+        unknown_reviewer="noop",
+        reviewer_timeout_ms=250,
         audit_dir=root / "audit",
         audit_retention_days=7,
         audit_max_file_mb=5,
@@ -173,6 +268,10 @@ def _load(path: Path | None = None) -> Config:
                 user = tomllib.load(f)
             # critical_paths 与默认合并（不让用户配置丢失 self-protection）
             if "critical_paths" in user:
+                if not isinstance(user["critical_paths"], list) or any(
+                    not isinstance(path, str) for path in user["critical_paths"]
+                ):
+                    raise ValueError("critical_paths must be an array of strings")
                 merged = list(dict.fromkeys(list(raw["critical_paths"]) + list(user["critical_paths"])))
                 user["critical_paths"] = merged
             user_wrapper_specs = user.get("wrapper_specs")
@@ -188,24 +287,31 @@ def _load(path: Path | None = None) -> Config:
         raw["fail_open"] = True
     if os.environ.get(_DRY_RUN_ENV) == "1":
         raw["dry_run"] = True
+    if os.environ.get(_AUDIT_INCLUDE_BODY_ENV) == "1":
+        raw["audit_include_body"] = True
     if os.environ.get("SAFETY_GUARD_IGNORE_DISABLED_RULES") == "1":
         # 只会让规则更全，不会放松防线。测试用：改 hook 自身时要在 toml 里临时把
         # 自保护规则塞进 disabled_rules，那个窗口会让十来条自保护测试假性 FAIL。
         raw["disabled_rules"] = []
 
+    _validate_raw(raw)
+
     return Config(
-        disabled_rules=tuple(raw["disabled_rules"]),
-        severity_overrides=dict(raw["severity_overrides"]),
-        protected_branches=tuple(raw["protected_branches"]),
-        read_only_zones=tuple(_expand_path(z) for z in raw["read_only_zones"]),
-        read_only_commands=frozenset(raw["read_only_commands"]),
-        critical_paths=tuple(_expand_path(p) for p in raw["critical_paths"]),
-        fail_open=bool(raw["fail_open"]),
-        dry_run=bool(raw["dry_run"]),
+        disabled_rules=tuple(_string_list(raw, "disabled_rules")),
+        severity_overrides=_severity_overrides(raw),
+        protected_branches=tuple(_string_list(raw, "protected_branches")),
+        read_only_zones=tuple(_expand_path(z) for z in _string_list(raw, "read_only_zones")),
+        read_only_commands=frozenset(_string_list(raw, "read_only_commands")),
+        critical_paths=tuple(_expand_path(p) for p in _string_list(raw, "critical_paths")),
+        fail_open=_bool_value(raw, "fail_open"),
+        dry_run=_bool_value(raw, "dry_run"),
+        audit_include_body=_bool_value(raw, "audit_include_body"),
+        unknown_reviewer=str(raw.get("unknown_reviewer") or "noop"),
+        reviewer_timeout_ms=_int_value(raw, "reviewer_timeout_ms", minimum=1),
         audit_dir=_expand_path(raw["audit_dir"]),
-        audit_retention_days=int(raw["audit_retention_days"]),
-        audit_max_file_mb=int(raw["audit_max_file_mb"]),
-        audit_max_total_mb=int(raw["audit_max_total_mb"]),
+        audit_retention_days=_int_value(raw, "audit_retention_days", minimum=0),
+        audit_max_file_mb=_int_value(raw, "audit_max_file_mb", minimum=1),
+        audit_max_total_mb=_int_value(raw, "audit_max_total_mb", minimum=1),
         load_error=load_error,
         wrapper_commands=_wrapper_command_names(raw),
         wrapper_specs=_bash_ast.merge_wrapper_specs(raw.get("wrapper_specs")),

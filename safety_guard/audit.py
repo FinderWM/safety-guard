@@ -9,12 +9,11 @@
 
 字段（优化拦截用）：
   - adapter：平台适配器名（唯一平台标识；历史日志可能只有 harness）
-  - engine_decision：规则引擎结论 allow|ask|deny（dry_run 时仍是真实结论）
-  - rendered_decision：写入平台后的对外结论（Grok 会把 ask 升 deny）
+  - engine_decision：规则引擎/reviewer 结论 allow|ask|deny|abstain
+  - rendered_decision：写入平台后的对外结论
   - decision：兼容旧字段；等于 engine_decision，dry_run 时加 dry-run- 前缀
-  - cmd_body：脱敏后的完整输入（不超过 FULL_BODY_CHARS 时写入，供精确回放）
-  - cmd_truncated：超长时 true，仅有 cmd_preview
-  - cmd_preview：短预览（保留换行；超长截断），便于人读与 grep
+  - cmd_digest/cmd_chars/cmd_lines：默认保留的元数据
+  - cmd_body/cmd_preview：仅 audit_include_body=true 时写入
   - hook_event：规范化事件名（若有）
 """
 from __future__ import annotations
@@ -24,11 +23,13 @@ import hashlib
 import json
 import os
 import re
+import stat
 import time
 from pathlib import Path
 from typing import Any
 
 from . import config as _cfg
+from .helpers import safe_identifier
 
 _STAMP = ".last-pruned"
 _PRUNE_INTERVAL_S = 3600
@@ -115,7 +116,12 @@ def _maybe_prune(audit_dir: Path, cfg: _cfg.Config) -> None:
     stamp = audit_dir / _STAMP
     now = time.time()
     try:
-        if stamp.exists() and (now - stamp.stat().st_mtime) < _PRUNE_INTERVAL_S:
+        stamp_stat = stamp.lstat()
+        if (
+            stat.S_ISREG(stamp_stat.st_mode)
+            and stamp_stat.st_nlink == 1
+            and (now - stamp_stat.st_mtime) < _PRUNE_INTERVAL_S
+        ):
             return
     except OSError:
         pass
@@ -142,10 +148,7 @@ def _maybe_prune(audit_dir: Path, cfg: _cfg.Config) -> None:
         except OSError:
             pass
 
-    try:
-        stamp.touch()
-    except OSError:
-        pass
+    _touch_private_stamp(stamp)
 
 
 def _digest(cmd: str) -> str:
@@ -180,15 +183,50 @@ def _redact(text: str) -> str:
 def _ensure_private_dir(path: Path) -> bool:
     try:
         path.mkdir(mode=_AUDIT_DIR_MODE, parents=True, exist_ok=True)
-        path.chmod(_AUDIT_DIR_MODE)
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(path, flags)
     except OSError:
         return False
-    return True
+    try:
+        current = os.fstat(fd)
+        if not stat.S_ISDIR(current.st_mode):
+            return False
+        os.fchmod(fd, _AUDIT_DIR_MODE)
+        return True
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+
+
+def _touch_private_stamp(path: Path) -> None:
+    flags = os.O_WRONLY | os.O_CREAT
+    flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags, _AUDIT_FILE_MODE)
+    except OSError:
+        return
+    try:
+        current = os.fstat(fd)
+        if not stat.S_ISREG(current.st_mode) or current.st_nlink != 1:
+            return
+        os.fchmod(fd, _AUDIT_FILE_MODE)
+        os.utime(fd, None)
+    except (OSError, TypeError, ValueError):
+        return
+    finally:
+        os.close(fd)
 
 
 def _append_private(path: Path, line: str) -> None:
-    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, _AUDIT_FILE_MODE)
+    flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT
+    flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags, _AUDIT_FILE_MODE)
     try:
+        current = os.fstat(fd)
+        if not stat.S_ISREG(current.st_mode) or current.st_nlink != 1:
+            raise OSError("audit target must be a single-link regular file")
         os.fchmod(fd, _AUDIT_FILE_MODE)
         with os.fdopen(fd, "a", encoding="utf-8") as handle:
             fd = -1
@@ -198,8 +236,8 @@ def _append_private(path: Path, line: str) -> None:
             os.close(fd)
 
 
-def _cmd_fields(raw_input: str) -> dict[str, Any]:
-    """构造命令正文相关字段：短命令存全文，长命令可截断回放。"""
+def _cmd_fields(raw_input: str, *, include_body: bool = False) -> dict[str, Any]:
+    """构造命令元数据；正文必须显式 opt-in。"""
     raw = raw_input if isinstance(raw_input, str) else ""
     redacted = _redact(raw)
     # digest 对脱敏后正文：回放与去重都基于落盘可见内容，避免同一命令因用户名分叉
@@ -208,6 +246,10 @@ def _cmd_fields(raw_input: str) -> dict[str, Any]:
         "cmd_chars": len(raw),
         "cmd_lines": raw.count("\n") + 1 if raw else 0,
     }
+    if not include_body:
+        fields["cmd_body_stored"] = False
+        return fields
+    fields["cmd_body_stored"] = True
     if len(redacted) <= FULL_BODY_CHARS:
         fields["cmd_body"] = redacted
         fields["cmd_truncated"] = False
@@ -231,9 +273,13 @@ def _redact_value(value: Any) -> Any:
     return value
 
 
-def _redact_matches(matches: list[dict]) -> list[dict]:
+def _redact_matches(matches: list[dict], *, include_details: bool) -> list[dict]:
     out: list[dict] = []
     for m in matches:
+        mm = {key: m[key] for key in ("id", "severity") if key in m}
+        if not include_details:
+            out.append(mm)
+            continue
         mm = dict(m)
         if isinstance(mm.get("reason"), str):
             mm["reason"] = _redact(mm["reason"])
@@ -243,10 +289,22 @@ def _redact_matches(matches: list[dict]) -> list[dict]:
     return out
 
 
-def infer_rendered_decision(output: dict[str, Any] | None, *, engine_decision: str) -> str:
+def infer_rendered_decision(
+    output: dict[str, Any] | None,
+    *,
+    engine_decision: str,
+    adapter: str | None = None,
+    hook_event: str | None = None,
+) -> str:
     """从 adapter.render 输出推断平台侧最终决策。"""
     if not output:
-        # Claude/Codex allow → {} ；也兼容「无输出即放行」
+        # Grok 官方协议将退出 0 + 无输出定义为 allow。Claude/Codex
+        # 则只表示 Hook 不作决定，不应在审计中伪造显式授权。
+        if adapter == "grok":
+            return "allow"
+        if adapter in {"claude", "codex-pretool", "codex-permission"} or hook_event == "PermissionRequest":
+            return "abstain"
+        # 保留未标注 adapter 的旧调用语义。
         return "allow"
     top = output.get("decision")
     if top in ("allow", "deny", "ask"):
@@ -265,7 +323,7 @@ def infer_rendered_decision(output: dict[str, Any] | None, *, engine_decision: s
     if output.get("systemMessage") and engine_decision == "ask":
         return "ask"
     # 有输出但认不出时，保守跟引擎
-    if engine_decision in ("allow", "ask", "deny"):
+    if engine_decision in ("allow", "ask", "deny", "abstain"):
         return engine_decision
     return "allow"
 
@@ -285,6 +343,8 @@ def write(
     rendered_decision: str | None = None,
     hook_event: str | None = None,
     dry_run: bool | None = None,
+    classification: str | None = None,
+    review: dict[str, Any] | None = None,
 ) -> None:
     """写入一条审计。decision 保持旧语义；engine/rendered 为优化用显式字段。"""
     if disabled():
@@ -297,7 +357,7 @@ def write(
     _maybe_prune(audit_dir, cfg)
 
     eng = engine_decision or decision.removeprefix("dry-run-")
-    if eng not in ("allow", "ask", "deny"):
+    if eng not in ("allow", "ask", "deny", "abstain"):
         eng = decision.removeprefix("dry-run-") if decision else "allow"
     rendered = rendered_decision if rendered_decision is not None else eng
     is_dry = bool(cfg.dry_run if dry_run is None else dry_run)
@@ -309,10 +369,11 @@ def write(
     record: dict[str, Any] = {
         "ts": _dt.datetime.now(_dt.timezone.utc).astimezone().isoformat(timespec="seconds"),
         "adapter": adapter or "unknown",
-        "tool": tool,
+        "tool": safe_identifier(tool),
         "cwd": _redact(cwd),
-        **_cmd_fields(raw_input),
-        "matches": _redact_matches(matches),
+        **_cmd_fields(raw_input, include_body=cfg.audit_include_body),
+        "matches": _redact_matches(matches, include_details=cfg.audit_include_body),
+        "match_details_stored": cfg.audit_include_body,
         "decision": compat,
         "engine_decision": eng,
         "rendered_decision": rendered,
@@ -320,12 +381,16 @@ def write(
     if cfg.load_error:
         record["config_load_error"] = cfg.load_error
     if hook_event:
-        record["hook_event"] = hook_event
+        record["hook_event"] = safe_identifier(hook_event)
+    if classification:
+        record["classification"] = classification
+    if review:
+        record["review"] = _redact_value(review)
     if is_dry:
         record["dry_run"] = True
     if error_type:
         record["error_type"] = error_type
-    if error_detail:
+    if error_detail and cfg.audit_include_body:
         record["error_detail"] = _redact(error_detail)
 
     line = json.dumps(record, ensure_ascii=False) + "\n"
@@ -349,15 +414,28 @@ def record_evaluation(
     hook_event: str | None = None,
     error_type: str | None = None,
     error_detail: str | None = None,
+    classification: str | None = None,
+    review: dict[str, Any] | None = None,
 ) -> None:
     """evaluate + render 之后的统一落盘入口。"""
     eng = engine_decision
     if config.dry_run:
-        # dry_run：引擎结论保留，平台侧视为 allow
-        rendered = "allow"
+        # dry_run：引擎结论保留，平台侧不拦截；PermissionRequest 的空输出仍是
+        # abstain（保留 Codex 原生审批），而非伪造显式 allow。
+        rendered = infer_rendered_decision(
+            rendered_output,
+            engine_decision="allow",
+            adapter=adapter,
+            hook_event=hook_event,
+        )
         compat = f"dry-run-{eng}"
     else:
-        rendered = infer_rendered_decision(rendered_output, engine_decision=eng)
+        rendered = infer_rendered_decision(
+            rendered_output,
+            engine_decision=eng,
+            adapter=adapter,
+            hook_event=hook_event,
+        )
         compat = eng
     write(
         tool=tool,
@@ -373,4 +451,6 @@ def record_evaluation(
         dry_run=config.dry_run,
         error_type=error_type,
         error_detail=error_detail,
+        classification=classification,
+        review=review,
     )
