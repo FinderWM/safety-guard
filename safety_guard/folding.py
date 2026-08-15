@@ -23,6 +23,8 @@ from __future__ import annotations
 
 import os
 
+from .helpers import normalize_cmd_name
+
 # 只信任值固定且与机密无关的环境变量。HOME 是路径判定的基准，必须支持；
 # PATH/LD_PRELOAD 这类由 bash-env-subversion 单独负责，不在这里展开。
 _TRUSTED_ENV = ("HOME",)
@@ -92,6 +94,10 @@ def fold_command(cmd, env: dict[str, str], home: str) -> None:
             w.folded = _fold_parts(w.source, w.base, w.parts, env, home)
         else:
             w.folded = _strip_quotes(w.raw)
+
+    words = list(getattr(cmd, "words", []) or [])
+    if words and words[0].folded is not None:
+        cmd.name = normalize_cmd_name(words[0].folded)
 
     # bashlex 将重定向目标挂在 command.redirects，不在 words 中；若不折叠，
     # `F=existing; echo x > "$F"` 会退回字面 `$F` 并漏掉覆盖检查。

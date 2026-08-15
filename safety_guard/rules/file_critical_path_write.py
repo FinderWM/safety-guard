@@ -1,4 +1,4 @@
-"""file-critical-path-write：file 工具命中 critical_paths 时直接拒绝。"""
+"""file-critical-path-write：file 工具命中 critical_paths 时要求确认。"""
 from __future__ import annotations
 
 from ..context import FileToolContext
@@ -10,9 +10,9 @@ from .registry import register
 @register
 class FileCriticalPathWrite(Rule):
     id = "file-critical-path-write"
-    severity = "high"
+    severity = "medium"
     applies_to = ("Write", "Edit", "NotebookEdit")
-    description = "写入 critical_paths（如 ~/.codex/config.toml）直接拒绝"
+    description = "写入 critical_paths（如 ~/.codex/hooks.json）需要用户确认"
 
     def match(self, ctx: FileToolContext) -> RuleMatch | None:
         candidates = [ctx.target_path]
@@ -30,6 +30,6 @@ class FileCriticalPathWrite(Rule):
         return RuleMatch(
             rule_id=self.id,
             severity=self.severity,
-            reason=f"{ctx.tool} 目标 {ctx.target_path} 指向 critical path {critical_target}，已拒绝",
+            reason=f"{ctx.tool} 目标 {ctx.target_path} 指向 critical path {critical_target}，需要用户确认",
             extra={"target": str(ctx.target_path), "critical_target": str(critical_target)},
         )

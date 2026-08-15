@@ -162,7 +162,7 @@ def test_native_write_lowercase_overwrite_projects_to_allow(grok, cwd: Path):
     assert out == {}
 
 
-def test_edit_dot_grok_config_denied(grok, cwd: Path):
+def test_edit_dot_grok_config_preserves_native_flow(grok, cwd: Path):
     from pathlib import Path as P
     out = grok(
         "search_replace",
@@ -173,8 +173,7 @@ def test_edit_dot_grok_config_denied(grok, cwd: Path):
         },
         cwd,
     )
-    assert out["decision"] == "deny"
-    assert "file-critical-path-write" in out["reason"] or "file-outside-cwd" in out["reason"]
+    assert out == {}
 
 
 def test_read_dot_grok_zone_allowed(grok, cwd: Path):

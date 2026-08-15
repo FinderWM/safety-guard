@@ -4,7 +4,7 @@
 本规则看 urllib/requests/fetch + exec/eval 这类「下载并在解释器内执行」——
 不一定出现 shell 逃逸 API，但语义同样是盲跑远端代码。
 
-定级 medium：合法调试里偶发 urlopen+print；双信号（取指∧执行）才触发。
+定级 high：只有同时出现网络取指与 exec/eval 才触发，语义已经是盲跑远端代码。
 heredoc 正文 bashlex 不可见，故同时扫 raw_command（仅当命令行含解释器名时）。
 """
 from __future__ import annotations
@@ -64,7 +64,7 @@ def _dual_signal(text: str) -> bool:
 @register
 class BashInterpreterRemoteExec(Rule):
     id = "bash-interpreter-remote-exec"
-    severity = "medium"
+    severity = "high"
     applies_to = ("Bash",)
     description = "解释器载荷同时出现网络取指与 exec/eval，可能盲跑远端代码"
 
@@ -98,8 +98,8 @@ class BashInterpreterRemoteExec(Rule):
             rule_id=self.id,
             severity=self.severity,
             reason=(
-                f"解释器上下文同时出现网络取指与 exec/eval（{', '.join(hits)}），"
-                "可能下载并执行远端代码。请改为先下载到本地审查后再运行。"
+                f"拒绝执行：解释器上下文同时出现网络取指与 exec/eval（{', '.join(hits)}），"
+                "会下载并立即执行远端代码。请改为先下载到本地审查后再运行。"
             ),
             extra={"where": hits},
         )

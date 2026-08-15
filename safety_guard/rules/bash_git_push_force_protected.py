@@ -80,6 +80,47 @@ def _push_refspecs(args: list[str]) -> list[str]:
     return positionals if repository_from_option else positionals[1:]
 
 
+def _word_text(word) -> tuple[str, bool]:
+    folded = getattr(word, "folded", None)
+    if folded is not None:
+        return str(folded), True
+    raw = str(getattr(word, "raw", word))
+    return raw, not bool(getattr(word, "has_expansion", False))
+
+
+def _push_refspec_words(args: list) -> list:
+    """WordSpec version of _push_refspecs, retaining expansion certainty."""
+    positionals: list = []
+    repository_from_option = False
+    after_options = False
+    index = 0
+    while index < len(args):
+        raw, _ = _word_text(args[index])
+        if after_options:
+            positionals.append(args[index])
+            index += 1
+            continue
+        if raw == "--":
+            after_options = True
+            index += 1
+            continue
+        if raw in GIT_PUSH_VALUE_OPTIONS:
+            if raw == "--repo":
+                repository_from_option = True
+            index += 2
+            continue
+        if raw.startswith("--repo="):
+            repository_from_option = True
+            index += 1
+            continue
+        if raw.startswith("--") or (raw.startswith("-") and raw != "-"):
+            index += 1
+            continue
+        positionals.append(args[index])
+        index += 1
+    return positionals if repository_from_option else positionals[1:]
+
+
 def _normalize_branch(token: str) -> str:
     """去掉 + / : 前缀和 refs/heads/，得到分支名。"""
     t = token[1:] if token.startswith("+") else token
@@ -96,6 +137,14 @@ def _normalize_branch(token: str) -> str:
 def _branch_from_refspec(token: str) -> str:
     """去掉强制前缀 +，再取 refspec 右侧（远端分支）。"""
     return _normalize_branch(token)
+
+
+def _destination_is_symbolic(token: str) -> bool:
+    branch = _branch_from_refspec(token)
+    return (
+        branch in {"HEAD", "@", "FETCH_HEAD", "ORIG_HEAD"}
+        or branch.startswith(("HEAD~", "HEAD^", "@{"))
+    )
 
 
 def _is_delete_push(args: list[str]) -> bool:
@@ -118,13 +167,16 @@ class BashGitPushForceProtected(Rule):
         for cmd in ctx.ast.commands:
             if cmd.name != "git":
                 continue
-            args = [w.raw for w in cmd.args]
+            arg_words = list(cmd.args)
+            args = [_word_text(word)[0] for word in arg_words]
             subcommand, push_args = git_subcommand_args(args)
             if subcommand != "push":
                 continue
+            push_words = arg_words[len(arg_words) - len(push_args):]
             if git_push_is_non_mutating(push_args):
                 continue
             refspecs = _push_refspecs(push_args)
+            refspec_words = _push_refspec_words(push_words)
             deleting = _is_delete_push(push_args)
             forcing = _is_force(push_args) or "--mirror" in _push_control_tokens(push_args)
             if not deleting and not forcing:
@@ -140,6 +192,23 @@ class BashGitPushForceProtected(Rule):
                         ),
                     )
                 continue
+            unresolved: list[str] = []
+            for word in refspec_words:
+                target, known = _word_text(word)
+                if not known or _destination_is_symbolic(target):
+                    unresolved.append(target)
+            if unresolved:
+                mode = "delete" if deleting else "force-push"
+                return RuleMatch(
+                    rule_id=self.id,
+                    severity=self.severity,
+                    reason=(
+                        f"拒绝执行：`{ctx.raw_command}` 的 {mode} 目标无法静态确定"
+                        f"（{', '.join(unresolved)}），不能证明其不会指向受保护分支。"
+                        "请显式指定远端非保护分支后重试。"
+                    ),
+                    extra={"targets": unresolved, "mode": mode, "unresolved": True},
+                )
             protected = [
                 _branch_from_refspec(target)
                 for target in refspecs

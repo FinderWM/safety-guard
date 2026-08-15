@@ -58,9 +58,12 @@ def test_pretool_high_is_denied(pretool, cwd: Path):
     assert "bash-git-push-force-protected" in out["hookSpecificOutput"]["permissionDecisionReason"]
 
 
-def test_pretool_medium_abstains(pretool, cwd: Path):
+def test_pretool_medium_emits_non_authorizing_warning(pretool, cwd: Path):
     out = pretool("Bash", {"command": "rm -rf ./tmp-dir"}, cwd)
-    assert out == {}
+    assert "systemMessage" in out
+    assert out["hookSpecificOutput"]["hookEventName"] == "PreToolUse"
+    assert "additionalContext" in out["hookSpecificOutput"]
+    assert "permissionDecision" not in out["hookSpecificOutput"]
 
 
 def test_permission_medium_preserves_native_approval(permission, cwd: Path):
@@ -89,16 +92,31 @@ def test_permission_edit_inside_cwd_is_allowed(permission, cwd: Path):
     assert out == {}
 
 
-def test_pretool_write_existing_file_abstains(pretool, cwd: Path):
+def test_pretool_write_existing_file_warns(pretool, cwd: Path):
     target = cwd / "existing.txt"
     target.write_text("old", encoding="utf-8")
 
     out = pretool("Write", {"file_path": str(target), "content": "new"}, cwd)
 
-    assert out == {}
+    assert "file-overwrite-existing" in out["hookSpecificOutput"]["additionalContext"]
+    assert "permissionDecision" not in out["hookSpecificOutput"]
 
 
-def test_apply_patch_critical_path_denied(permission, cwd: Path):
+def test_pretool_apply_patch_critical_path_warns(pretool, cwd: Path):
+    cmd = _patch(
+        """*** Update File: ~/.codex/config.toml
+@@
+-old
++new"""
+    )
+    out = pretool("apply_patch", {"command": cmd}, cwd)
+    hs = out["hookSpecificOutput"]
+    assert hs["hookEventName"] == "PreToolUse"
+    assert "file-critical-path-write" in hs["additionalContext"]
+    assert "permissionDecision" not in hs
+
+
+def test_apply_patch_critical_path_preserves_native_approval(permission, cwd: Path):
     cmd = _patch(
         """*** Update File: ~/.codex/config.toml
 @@
@@ -106,10 +124,7 @@ def test_apply_patch_critical_path_denied(permission, cwd: Path):
 +new"""
     )
     out = permission("apply_patch", {"command": cmd}, cwd)
-    hs = out["hookSpecificOutput"]
-    assert hs["hookEventName"] == "PermissionRequest"
-    assert hs["decision"]["behavior"] == "deny"
-    assert "file-critical-path-write" in hs["decision"]["message"]
+    assert out == {}
 
 
 def test_apply_patch_delete_preserves_native_approval(permission, cwd: Path):
@@ -120,7 +135,7 @@ def test_apply_patch_delete_preserves_native_approval(permission, cwd: Path):
     assert out == {}
 
 
-def test_apply_patch_any_high_wins(permission, cwd: Path):
+def test_apply_patch_any_critical_target_preserves_native_approval(permission, cwd: Path):
     safe = cwd / "safe.txt"
     safe.write_text("ok")
     cmd = _patch(
@@ -134,9 +149,7 @@ def test_apply_patch_any_high_wins(permission, cwd: Path):
 +y"""
     )
     out = permission("apply_patch", {"command": cmd}, cwd)
-    hs = out["hookSpecificOutput"]
-    assert hs["decision"]["behavior"] == "deny"
-    assert "file-critical-path-write" in hs["decision"]["message"]
+    assert out == {}
 
 
 def test_apply_patch_parse_error_fails_closed(pretool, cwd: Path):
@@ -293,13 +306,14 @@ def test_chrome_mcp_required_path_fails_closed(
     assert "hook 输入解析失败" in hs["permissionDecisionReason"]
 
 
-def test_chrome_mcp_output_overwrite_abstains(pretool, cwd: Path):
+def test_chrome_mcp_output_overwrite_warns(pretool, cwd: Path):
     target = cwd / "image.png"
     target.write_text("synthetic", encoding="utf-8")
 
     out = pretool("mcp__chrome_devtools__take_screenshot", {"filePath": str(target)}, cwd)
 
-    assert out == {}
+    assert "file-overwrite-existing" in out["hookSpecificOutput"]["additionalContext"]
+    assert "permissionDecision" not in out["hookSpecificOutput"]
 
 
 def test_lighthouse_existing_output_directory_is_allowed(pretool, cwd: Path):
@@ -313,14 +327,15 @@ def test_lighthouse_existing_output_directory_is_allowed(pretool, cwd: Path):
     ) == {}
 
 
-def test_lighthouse_output_directory_outside_cwd_abstains(pretool, cwd: Path):
+def test_lighthouse_output_directory_outside_cwd_warns(pretool, cwd: Path):
     out = pretool(
         "mcp__chrome_devtools__lighthouse_audit",
         {"outputDirPath": "/nonexistent-probe/reports"},
         cwd,
     )
 
-    assert out == {}
+    assert "file-outside-cwd" in out["hookSpecificOutput"]["additionalContext"]
+    assert "permissionDecision" not in out["hookSpecificOutput"]
 
 
 @pytest.mark.parametrize(
@@ -361,9 +376,10 @@ def test_chrome_mcp_upload_paths_have_external_upload_marker(
         {"filePaths": ["one.txt", "two.txt"]},
     ],
 )
-def test_chrome_mcp_upload_inside_cwd_abstains(tool_input: dict, pretool, cwd: Path):
+def test_chrome_mcp_upload_inside_cwd_warns(tool_input: dict, pretool, cwd: Path):
     out = pretool("mcp__chrome_devtools__upload_file", tool_input, cwd)
-    assert out == {}
+    assert "file-external-upload" in out["hookSpecificOutput"]["additionalContext"]
+    assert "permissionDecision" not in out["hookSpecificOutput"]
 
 
 def test_chrome_mcp_upload_aliases_cannot_be_combined(pretool, cwd: Path):

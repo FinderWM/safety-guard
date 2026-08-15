@@ -307,7 +307,7 @@ def test_reviewer_path_and_cwd_values_are_replaced_by_structure(cwd: Path):
     assert secret_segment not in blob
 
 
-def test_codex_permission_reviewer_allow_is_explicit():
+def test_codex_permission_reviewer_cannot_grant_unknown_tool():
     adapter = get("codex-permission")
     payload = _input(Path("/synthetic-review-cwd"), {"action": "safe"})
     payload["hook_event_name"] = "PermissionRequest"
@@ -317,7 +317,18 @@ def test_codex_permission_reviewer_allow_is_explicit():
         config=replace(load_config(), fail_open=False),
         reviewer=StaticReviewer("allow"),
     )
-    assert output["hookSpecificOutput"]["decision"] == {"behavior": "allow"}
+    assert output == {}
+
+
+def test_reviewer_allow_is_coerced_to_abstain(cwd: Path):
+    result = engine.evaluate(
+        _request(cwd),
+        replace(load_config(), fail_open=False),
+        reviewer=StaticReviewer("allow"),
+    )
+
+    assert result.decision == "abstain"
+    assert result.review["error_type"] == "allow_not_authoritative"
 
 
 @pytest.mark.parametrize("review_decision", ["allow", "deny", "ask", "abstain"])

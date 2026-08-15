@@ -250,10 +250,10 @@ python3 safety-guard.py --adapter grok
 ### Codex 渲染
 
 - `allow` / `abstain` → `{}`；策略 allow 不等于平台授权
-- `ask` + PreToolUse → `{}`，因为 Codex 当前不支持 ask，且不把 medium 升成 deny
+- `ask` + PreToolUse → `systemMessage` + `additionalContext`，只提示风险，不输出授权或阻断决定
 - `ask` + PermissionRequest → `{}`，保留 Codex 原生审批
 - `deny` → 对应事件的原生 deny 结构
-- reviewer 明确 allow + PermissionRequest → `decision.behavior: allow`
+- reviewer 的 allow → 按 `abstain` 处理，不能替代任一事件的原生授权
 
 ### Grok 渲染
 
@@ -288,8 +288,9 @@ python3 safety-guard.py --adapter grok
 Codex 的 `PreToolUse` 与 `PermissionRequest` matcher 均使用 `.*`，使所有当前支持的
 本地函数工具进入前置流程。未知工具不猜测 schema，也不产生规则 Operation，而是标为
 `unknown` 后进入 reviewer。默认 `noop` 返回 `abstain`；超时、异常、递归和非法结果也
-统一 abstain。reviewer 只收到字段形状、长度、脱敏路径和 URL 主机等摘要，不收到命令、
-补丁、正文或凭据原值。已建模工具的路径字段或 `tool_input` 畸形仍 fail-closed。
+统一 abstain。reviewer 只能 deny 或 ask；返回 allow 会被降为 abstain，避免 reviewer
+跳过平台原生审批。reviewer 只收到字段形状、长度、脱敏路径和 URL 主机等摘要，不收到
+命令、补丁、正文或凭据原值。已建模工具的路径字段或 `tool_input` 畸形仍 fail-closed。
 
 ## 审计字段（优化拦截）
 
@@ -297,6 +298,7 @@ Codex 的 `PreToolUse` 与 `PermissionRequest` matcher 均使用 `.*`，使所�
 
 | 字段 | 含义 |
 | --- | --- |
+| `safety_guard_schema` | Safety Guard 自有日志标记，用于限定可追加与可清理文件 |
 | `adapter` | 平台适配器（`claude` / `grok` / `codex-*`） |
 | `engine_decision` | 规则引擎或 reviewer 结论 `allow`/`ask`/`deny`/`abstain` |
 | `rendered_decision` | Adapter 输出的显式决策；无决策为 `abstain`，Grok 无输出按官方协议记为 `allow` |
@@ -312,7 +314,8 @@ Codex 的 `PreToolUse` 与 `PermissionRequest` matcher 均使用 `.*`，使所�
 
 `tools/replay.py` 只有在审计显式保存 `cmd_body` 时才能精确回放，并与
 `engine_decision` 对比。
-审计目录固定为 `0700`，日志文件固定为 `0600`。
+新建审计目录使用 `0700`，日志文件使用 `0600`。既存目录不是 `0700` 时拒绝写入，
+不会修改其权限；轮转只追加和清理带 `safety_guard_schema` 标记的自有日志。
 
 ## 接入新平台
 
@@ -443,7 +446,6 @@ class ExampleRule(Rule):
 | `bash-remote-stdin-exec` | Bash | shell/source 从 stdin/进程替换执行且含网络抓取 |
 | `bash-rm-root-or-home` | Bash | `rm` 目标为 `/` 或 `$HOME` |
 | `bash-sql-drop-database` | Bash | `DROP DATABASE` / `DROP SCHEMA` |
-| `file-critical-path-write` | Write/Edit/NotebookEdit | 写入 critical_paths |
 | `file-external-upload` | Read | 上传敏感、CWD 外或 symlink 外指文件 |
 | `bash-interpreter-write` | Bash | 解释器 -c/-e 写/删 critical_paths |
 
@@ -479,6 +481,7 @@ class ExampleRule(Rule):
 | `bash-terraform-destroy` | Bash | `terraform destroy` 删除托管资源 |
 | `bash-unresolvable-path` | Bash | 路径槽静态不可解释 |
 | `file-external-upload` | Read | 上传工作区内普通文件 |
+| `file-critical-path-write` | Write/Edit/NotebookEdit | 写入 critical_paths，要求用户确认 |
 | `file-instruction-zone-write` | Write/Edit/NotebookEdit | 写指令区 |
 | `file-outside-cwd` | Write/Edit/NotebookEdit/Read | 目标在 CWD 外 |
 | `file-overwrite-existing` | Write | 整文件覆盖 |
@@ -486,9 +489,9 @@ class ExampleRule(Rule):
 | `file-symlink-write` | Write/Edit/NotebookEdit | 写入现有 symlink 或其下级路径 |
 | `notebook-delete` | NotebookEdit | `edit_mode=delete` |
 
-改包内文件时若命中自保，可临时把
-`file-critical-path-write`（及必要时 `bash-disable-safety-hook`）写入
-`disabled_rules`；改完务必清空并复检。
+文件工具写入 `critical_paths` 默认进入 ask；Bash 直接写删仍由
+`bash-disable-safety-hook` high 规则拒绝。只有修复该 Bash 自保规则本身时，才应临时将其
+写入 `disabled_rules`，改完立即清空并复检。
 
 ## 决策聚合
 
@@ -542,7 +545,7 @@ cp safety_guard.toml.example safety_guard.toml
 | `read_only_commands` | 只读命令白名单 |
 | `wrapper_commands` | 前缀包装命令（剥掉后按内层分发） |
 | `wrapper_specs.<name>` | 包装剥层语义：`value_opts` / `skip_positional` / `subcommands` |
-| `critical_paths` | 高危路径（与默认自保合并） |
+| `critical_paths` | 高危路径（与默认自保合并）；文件工具 ask，Bash 写删 deny |
 | `fail_open` / `dry_run` | 行为开关 |
 | `unknown_reviewer` / `reviewer_timeout_ms` | 未知工具 reviewer 与超时 |
 | `audit_include_body` | 是否保存脱敏正文，默认 false |
@@ -560,7 +563,7 @@ cp safety_guard.toml.example safety_guard.toml
 
 ## 不透明执行（expand 收集器）
 
-`bash_ast.expand()` 除展开 wrapper 与 `sh -c` 字面载荷外，还会收集运行时才成形的执行形态，写入 `opaque_payloads`：
+`bash_ast.expand()` 除展开 wrapper 与 `sh -c` 字面载荷外，还会递归分析可确定的二级命令槽（`find -exec`、Git alias、SSH `ProxyCommand`、tar checkpoint exec、sed `e`），并把运行时才成形的执行形态写入 `opaque_payloads`：
 
 | kind | 形态 | 规则 |
 | --- | --- | --- |
@@ -568,8 +571,9 @@ cp safety_guard.toml.example safety_guard.toml
 | `placeholder` | `xargs -I{} sh -c '{}'`（字面 `{}` 禁止再 parse） | 同上 |
 | `process-subst` | `bash <(curl …)` / `source <(…)` / `. <(…)` | 同上 |
 | `find-exec` | `find … -exec/-execdir …` | 仅结构标记；rm 家族由 `bash-find-exec-rm` ask |
+| `command-slot` | 动态 argv[0]、ProxyCommand 或 sed `e` 载荷无法静态确定 | `bash-opaque-inline-script`（medium） |
 
-`find / … -exec rm` 仍由 `bash-find-delete-unbounded`（high）deny；`find . -delete` 与 `find . -exec rm` 由 `bash-find-exec-rm` ask；`find . -exec grep` allow。
+可确定的二级命令复用现有规则，例如 Git alias 内的 force-push 仍由 `bash-git-push-force-protected` deny。`find / … -exec rm` 仍由 `bash-find-delete-unbounded`（high）deny；`find . -delete` 与 `find . -exec rm` 由 `bash-find-exec-rm` ask；`find . -exec grep` allow。
 
 ## 调试命令
 

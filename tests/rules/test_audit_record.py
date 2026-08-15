@@ -232,10 +232,9 @@ def test_credentials_are_redacted_from_audit_body(
     assert audit.REDACTED_SECRET in blob
 
 
-def test_audit_permissions_are_private(audit_cfg, tmp_path: Path):
+def test_new_audit_permissions_are_private(audit_cfg, tmp_path: Path):
     cwd = tmp_path / "proj"
     cwd.mkdir()
-    audit_cfg.audit_dir.mkdir(mode=0o755)
     runner.run(
         {
             "hook_event_name": "PreToolUse",
@@ -249,6 +248,79 @@ def test_audit_permissions_are_private(audit_cfg, tmp_path: Path):
     log = next(audit_cfg.audit_dir.glob("audit-*.jsonl"))
     assert stat.S_IMODE(audit_cfg.audit_dir.stat().st_mode) == 0o700
     assert stat.S_IMODE(log.stat().st_mode) == 0o600
+
+
+def test_existing_non_private_audit_directory_is_not_chmodded(audit_cfg, tmp_path: Path):
+    cwd = tmp_path / "proj"
+    cwd.mkdir()
+    audit_cfg.audit_dir.mkdir(mode=0o755)
+    audit_cfg.audit_dir.chmod(0o755)
+
+    runner.run(
+        {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": "git status"},
+            "cwd": str(cwd),
+        },
+        adapter=get("claude"),
+        config=audit_cfg,
+    )
+
+    assert stat.S_IMODE(audit_cfg.audit_dir.stat().st_mode) == 0o755
+    assert list(audit_cfg.audit_dir.iterdir()) == []
+
+
+def test_prune_ignores_unmanaged_audit_like_files(audit_cfg, tmp_path: Path):
+    audit_cfg.audit_dir.mkdir(mode=0o700)
+    audit_cfg.audit_dir.chmod(0o700)
+    unrelated = audit_cfg.audit_dir / "audit-user-data.jsonl"
+    unrelated.write_text("sentinel", encoding="utf-8")
+    unrelated.chmod(0o600)
+    os.utime(unrelated, (0, 0))
+
+    audit._maybe_prune(audit_cfg.audit_dir, replace(audit_cfg, audit_retention_days=0))
+
+    assert unrelated.read_text(encoding="utf-8") == "sentinel"
+
+
+def test_unmarked_date_log_is_neither_appended_nor_pruned(audit_cfg, tmp_path: Path):
+    cwd = tmp_path / "proj"
+    cwd.mkdir()
+    audit_cfg.audit_dir.mkdir(mode=0o700)
+    audit_cfg.audit_dir.chmod(0o700)
+    existing = audit_cfg.audit_dir / f"audit-{date.today().isoformat()}.jsonl"
+    existing.write_text("sentinel\n", encoding="utf-8")
+    existing.chmod(0o600)
+    os.utime(existing, (0, 0))
+
+    runner.run(
+        {
+            "hook_event_name": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_input": {"command": "git status"},
+            "cwd": str(cwd),
+        },
+        adapter=get("claude"),
+        config=replace(audit_cfg, audit_retention_days=0),
+    )
+
+    assert existing.read_text(encoding="utf-8") == "sentinel\n"
+    managed = audit_cfg.audit_dir / f"audit-{date.today().isoformat()}-01.jsonl"
+    record = json.loads(managed.read_text(encoding="utf-8").splitlines()[0])
+    assert record["safety_guard_schema"] == audit._AUDIT_SCHEMA
+
+
+def test_three_digit_rolled_log_is_managed(audit_cfg):
+    audit_cfg.audit_dir.mkdir(mode=0o700)
+    rolled = audit_cfg.audit_dir / f"audit-{date.today().isoformat()}-100.jsonl"
+    rolled.write_text(
+        json.dumps({"safety_guard_schema": audit._AUDIT_SCHEMA}) + "\n",
+        encoding="utf-8",
+    )
+    rolled.chmod(0o600)
+
+    assert audit._is_managed_audit_file(rolled)
 
 
 @pytest.mark.parametrize("link_kind", ["symlink", "hardlink"])

@@ -44,6 +44,8 @@ TRUNCATION_SUFFIX = "…"
 REDACTED_SECRET = "<redacted>"
 _AUDIT_DIR_MODE = 0o700
 _AUDIT_FILE_MODE = 0o600
+_AUDIT_LOG_NAME = re.compile(r"audit-\d{4}-\d{2}-\d{2}(?:-\d{2,3})?\.jsonl\Z")
+_AUDIT_SCHEMA = "safety-guard-audit-v1"
 
 _SENSITIVE_NAME = (
     r"(?:(?:[A-Za-z][A-Za-z0-9]*[_-])*(?:api[_-]?key|access[_-]?(?:token|key)|"
@@ -95,21 +97,72 @@ def _today_path(audit_dir: Path, cfg: _cfg.Config) -> Path:
 def _rolled_path_if_needed(base: Path, audit_dir: Path, today: str, cfg: _cfg.Config) -> Path:
     cap = cfg.audit_max_file_mb * 1024 * 1024
     try:
-        if base.stat().st_size < cap:
+        if _is_managed_audit_file(base) and base.stat().st_size < cap:
             return base
     except OSError:
-        return base
+        pass
     n = 1
     while True:
         rolled = audit_dir / f"audit-{today}-{n:02d}.jsonl"
         try:
-            if not rolled.exists() or rolled.stat().st_size < cap:
+            if not rolled.exists():
+                return rolled
+            if _is_managed_audit_file(rolled) and rolled.stat().st_size < cap:
                 return rolled
         except OSError:
-            return rolled
+            pass
         n += 1
         if n > 999:
             return rolled
+
+
+def _is_managed_audit_file(path: Path) -> bool:
+    if _AUDIT_LOG_NAME.fullmatch(path.name) is None:
+        return False
+    try:
+        current = path.lstat()
+    except OSError:
+        return False
+    if not (
+        stat.S_ISREG(current.st_mode)
+        and current.st_nlink == 1
+        and current.st_uid == os.geteuid()
+        and stat.S_IMODE(current.st_mode) == _AUDIT_FILE_MODE
+    ):
+        return False
+    try:
+        with path.open("rb") as handle:
+            first_line = handle.readline(512)
+    except OSError:
+        return False
+    marker = f'"safety_guard_schema": "{_AUDIT_SCHEMA}"'.encode("ascii")
+    return marker in first_line
+
+
+def _fd_has_audit_schema(fd: int) -> bool:
+    marker = f'"safety_guard_schema": "{_AUDIT_SCHEMA}"'.encode("ascii")
+    try:
+        return marker in os.pread(fd, 512, 0)
+    except (AttributeError, OSError):
+        return False
+
+
+def _managed_audit_files(audit_dir: Path) -> list[Path]:
+    try:
+        entries = list(audit_dir.iterdir())
+    except OSError:
+        return []
+    return sorted(path for path in entries if _is_managed_audit_file(path))
+
+
+def _unlink_managed_audit_file(path: Path) -> bool:
+    if not _is_managed_audit_file(path):
+        return False
+    try:
+        path.unlink()
+        return True
+    except OSError:
+        return False
 
 
 def _maybe_prune(audit_dir: Path, cfg: _cfg.Config) -> None:
@@ -127,26 +180,24 @@ def _maybe_prune(audit_dir: Path, cfg: _cfg.Config) -> None:
         pass
 
     cutoff = now - cfg.audit_retention_days * 86400
-    files: list[Path] = sorted(audit_dir.glob("audit-*.jsonl"))
+    files = _managed_audit_files(audit_dir)
     for f in list(files):
         try:
-            if f.stat().st_mtime < cutoff:
-                f.unlink(missing_ok=True)
-                files.remove(f)
+            expired = f.lstat().st_mtime < cutoff
         except OSError:
             continue
+        if expired and _unlink_managed_audit_file(f):
+            files.remove(f)
 
     total_cap = cfg.audit_max_total_mb * 1024 * 1024
-    files.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0)
+    files = [path for path in files if _is_managed_audit_file(path)]
+    files.sort(key=lambda path: path.lstat().st_mtime)
     while files:
-        total = sum(f.stat().st_size for f in files if f.exists())
+        total = sum(path.lstat().st_size for path in files if _is_managed_audit_file(path))
         if total <= total_cap:
             break
         oldest = files.pop(0)
-        try:
-            oldest.unlink(missing_ok=True)
-        except OSError:
-            pass
+        _unlink_managed_audit_file(oldest)
 
     _touch_private_stamp(stamp)
 
@@ -181,8 +232,15 @@ def _redact(text: str) -> str:
 
 
 def _ensure_private_dir(path: Path) -> bool:
+    created = False
     try:
-        path.mkdir(mode=_AUDIT_DIR_MODE, parents=True, exist_ok=True)
+        path.mkdir(mode=_AUDIT_DIR_MODE, parents=True, exist_ok=False)
+        created = True
+    except FileExistsError:
+        pass
+    except OSError:
+        return False
+    try:
         flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
         flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
         fd = os.open(path, flags)
@@ -192,7 +250,12 @@ def _ensure_private_dir(path: Path) -> bool:
         current = os.fstat(fd)
         if not stat.S_ISDIR(current.st_mode):
             return False
-        os.fchmod(fd, _AUDIT_DIR_MODE)
+        if current.st_uid != os.geteuid():
+            return False
+        if created:
+            os.fchmod(fd, _AUDIT_DIR_MODE)
+        elif stat.S_IMODE(current.st_mode) != _AUDIT_DIR_MODE:
+            return False
         return True
     except OSError:
         return False
@@ -201,17 +264,31 @@ def _ensure_private_dir(path: Path) -> bool:
 
 
 def _touch_private_stamp(path: Path) -> None:
-    flags = os.O_WRONLY | os.O_CREAT
-    flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    base_flags = os.O_WRONLY
+    base_flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    created = False
     try:
-        fd = os.open(path, flags, _AUDIT_FILE_MODE)
+        fd = os.open(path, base_flags | os.O_CREAT | os.O_EXCL, _AUDIT_FILE_MODE)
+        created = True
+    except FileExistsError:
+        try:
+            fd = os.open(path, base_flags)
+        except OSError:
+            return
     except OSError:
         return
     try:
         current = os.fstat(fd)
-        if not stat.S_ISREG(current.st_mode) or current.st_nlink != 1:
+        if (
+            not stat.S_ISREG(current.st_mode)
+            or current.st_nlink != 1
+            or current.st_uid != os.geteuid()
+        ):
             return
-        os.fchmod(fd, _AUDIT_FILE_MODE)
+        if created:
+            os.fchmod(fd, _AUDIT_FILE_MODE)
+        elif stat.S_IMODE(current.st_mode) != _AUDIT_FILE_MODE:
+            return
         os.utime(fd, None)
     except (OSError, TypeError, ValueError):
         return
@@ -220,14 +297,30 @@ def _touch_private_stamp(path: Path) -> None:
 
 
 def _append_private(path: Path, line: str) -> None:
-    flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT
-    flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-    fd = os.open(path, flags, _AUDIT_FILE_MODE)
+    base_flags = os.O_RDWR | os.O_APPEND
+    base_flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    created = False
+    try:
+        fd = os.open(path, base_flags | os.O_CREAT | os.O_EXCL, _AUDIT_FILE_MODE)
+        created = True
+    except FileExistsError:
+        if not _is_managed_audit_file(path):
+            raise OSError("existing audit target is not owned by safety-guard")
+        fd = os.open(path, base_flags)
     try:
         current = os.fstat(fd)
-        if not stat.S_ISREG(current.st_mode) or current.st_nlink != 1:
+        if (
+            not stat.S_ISREG(current.st_mode)
+            or current.st_nlink != 1
+            or current.st_uid != os.geteuid()
+        ):
             raise OSError("audit target must be a single-link regular file")
-        os.fchmod(fd, _AUDIT_FILE_MODE)
+        if created:
+            os.fchmod(fd, _AUDIT_FILE_MODE)
+        elif stat.S_IMODE(current.st_mode) != _AUDIT_FILE_MODE:
+            raise OSError("existing audit target must already be private")
+        elif not _fd_has_audit_schema(fd):
+            raise OSError("existing audit target is missing the safety-guard schema")
         with os.fdopen(fd, "a", encoding="utf-8") as handle:
             fd = -1
             handle.write(line)
@@ -367,6 +460,7 @@ def write(
         compat = f"dry-run-{eng}"
 
     record: dict[str, Any] = {
+        "safety_guard_schema": _AUDIT_SCHEMA,
         "ts": _dt.datetime.now(_dt.timezone.utc).astimezone().isoformat(timespec="seconds"),
         "adapter": adapter or "unknown",
         "tool": safe_identifier(tool),

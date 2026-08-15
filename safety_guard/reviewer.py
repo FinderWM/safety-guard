@@ -346,6 +346,13 @@ def _coerce(raw: Any, reviewer_name: str) -> ReviewResult:
     if isinstance(raw, ReviewResult):
         if raw.decision not in {"allow", "deny", "ask", "abstain"}:
             return ReviewResult(reviewer=reviewer_name, status="abstain", error_type="invalid_decision")
+        if raw.decision == "allow":
+            return ReviewResult(
+                reviewer=reviewer_name,
+                status="abstain",
+                error_type="allow_not_authoritative",
+                reason="未知工具审查器仅可否决或请求确认，allow 不替代平台原生授权",
+            )
         return ReviewResult(
             decision=raw.decision,
             reason=raw.reason,
@@ -353,7 +360,14 @@ def _coerce(raw: Any, reviewer_name: str) -> ReviewResult:
             status=raw.decision,
             error_type=_safe_identifier(raw.error_type) if isinstance(raw.error_type, str) else None,
         )
-    if isinstance(raw, str) and raw in {"allow", "deny", "ask", "abstain"}:
+    if raw == "allow":
+        return ReviewResult(
+            reviewer=reviewer_name,
+            status="abstain",
+            error_type="allow_not_authoritative",
+            reason="未知工具审查器仅可否决或请求确认，allow 不替代平台原生授权",
+        )
+    if isinstance(raw, str) and raw in {"deny", "ask", "abstain"}:
         return ReviewResult(decision=raw, reviewer=reviewer_name, status=raw)
     return ReviewResult(reviewer=reviewer_name, status="abstain", error_type="invalid_result")
 

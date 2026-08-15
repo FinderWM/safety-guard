@@ -53,9 +53,12 @@ def test_pretool_high_risk_denies(cwd: Path):
     assert "bash-git-push-force-protected" in out["hookSpecificOutput"]["permissionDecisionReason"]
 
 
-def test_pretool_medium_risk_abstains(cwd: Path):
+def test_pretool_medium_risk_warns_without_authorizing(cwd: Path):
     out = _run(_pretool("rm -rf /tmp/foo", cwd), "codex-pretool")
-    assert out == {}
+    assert "systemMessage" in out
+    assert out["hookSpecificOutput"]["hookEventName"] == "PreToolUse"
+    assert "additionalContext" in out["hookSpecificOutput"]
+    assert "permissionDecision" not in out["hookSpecificOutput"]
 
 
 def test_permission_high_risk_denies(cwd: Path):
@@ -71,7 +74,22 @@ def test_permission_medium_risk_preserves_native_approval(cwd: Path):
     assert out == {}
 
 
-def test_permission_apply_patch_denies_on_critical_target(cwd: Path):
+def test_pretool_apply_patch_critical_target_warns(cwd: Path):
+    patch = """*** Begin Patch
+*** Update File: ~/.codex/config.toml
+@@
+-old
++new
+*** End Patch
+"""
+    out = _run(_pretool(patch, cwd, tool_name="apply_patch"), "codex-pretool")
+    hs = out["hookSpecificOutput"]
+    assert hs["hookEventName"] == "PreToolUse"
+    assert "file-critical-path-write" in hs["additionalContext"]
+    assert "permissionDecision" not in hs
+
+
+def test_permission_apply_patch_critical_target_preserves_native_approval(cwd: Path):
     patch = """*** Begin Patch
 *** Update File: ~/.codex/config.toml
 @@
@@ -80,12 +98,10 @@ def test_permission_apply_patch_denies_on_critical_target(cwd: Path):
 *** End Patch
 """
     out = _run(_permission(patch, cwd, tool_name="apply_patch"), "codex-permission")
-    decision = out["hookSpecificOutput"]["decision"]
-    assert decision["behavior"] == "deny"
-    assert "file-critical-path-write" in decision["message"]
+    assert out == {}
 
 
-def test_permission_apply_patch_denies_if_any_operation_is_high_risk(cwd: Path):
+def test_permission_apply_patch_critical_operation_preserves_native_approval(cwd: Path):
     safe = cwd / "safe.txt"
     safe.write_text("old")
     patch = f"""*** Begin Patch
@@ -100,9 +116,7 @@ def test_permission_apply_patch_denies_if_any_operation_is_high_risk(cwd: Path):
 *** End Patch
 """
     out = _run(_permission(patch, cwd, tool_name="apply_patch"), "codex-permission")
-    decision = out["hookSpecificOutput"]["decision"]
-    assert decision["behavior"] == "deny"
-    assert "file-critical-path-write" in decision["message"]
+    assert out == {}
 
 
 def test_permission_apply_patch_delete_preserves_native_approval(cwd: Path):

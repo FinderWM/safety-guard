@@ -18,7 +18,7 @@
 #   SAFETY_GUARD_NO_AUDIT=1  不写审计（pytest / --regression / 手工回放专用）
 #   SAFETY_GUARD_IGNORE_DISABLED_RULES=1  忽略下面的 disabled_rules（测试用）
 # 临时禁用某条规则（不需要时留空数组）
-# 改 safety_guard 包内文件时可临时加入 file-critical-path-write / bash-disable-safety-hook；改完务必清空。
+# 文件工具写入 critical_paths 默认 ask；只有修复 Bash 自保规则本身时才临时禁用 bash-disable-safety-hook。
 disabled_rules = []
 
 # git push --force 拦截的保护分支
@@ -63,11 +63,12 @@ wrapper_commands = [
 # 只写 [wrapper_specs.chronic] 也会自动把 chronic 加进剥层名单。
 # 同名会覆盖代码内置默认的对应字段；env -S / xargs -a 仍走代码特判。
 
-# 高危覆写保护：任何 bash 命令试图写入这些路径直接 deny
+# 高危路径保护：文件工具写入需要确认；任何 bash 命令试图写删这些路径仍直接 deny
 # 默认会自动保护 hook 自身（入口脚本 + safety_guard 包目录），下面是各 CLI 的额外保护：
 critical_paths = [
   "~/.claude/settings.json",
   "~/.codex/config.toml",
+  "~/.codex/hooks.json",
   "~/.grok/config.toml",
   "~/.grok/hooks",
 ]

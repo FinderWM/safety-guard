@@ -24,9 +24,9 @@
 - **越界读写**：CWD 外路径（含 `read_file` / `Read` / `grep`）；`~/.claude` / `~/.agents` 等指令区写入需确认
 - **整文件覆盖 / 删格**：`Write` 覆盖已有文件、`NotebookEdit delete`、`apply_patch` 删除
 - **外部上传**：工作区普通文件要求确认；敏感文件、CWD 外文件或 symlink 外传直接拒绝
-- **自保**：拒绝改写 safety-guard 入口、包目录及配置中的 `critical_paths`
-- **已建模但不可解释即标记**：路径槽静态算不清、内联/占位脚本运行时才成形 → medium/ask；动态执行覆盖仍 high/deny
-- **未知工具先审查**：进入可插拔 reviewer；默认 `noop` 返回 `abstain`，不新增拦截
+- **自保**：文件工具写入 safety-guard 入口、包目录及 `critical_paths` 时要求确认；Bash 写删仍直接拒绝
+- **已建模但不可解释即标记**：路径槽、动态 argv[0]、内联/命令槽载荷静态算不清 → medium/ask；可确定的二级命令重新进入完整规则分析
+- **未知工具先审查**：进入可插拔 reviewer；reviewer 可 deny/ask，但 allow 只按 `abstain` 处理，不替代平台授权
 - **包装不降级**：`rtk rm -rf /`、`sudo env FOO=1 rm …` 与裸命令同级拦截
 
 ## 工作原理（一句话）
@@ -109,27 +109,46 @@ cp safety_guard.toml.example safety_guard.toml
 
 ### 接入 Codex
 
-在用户级 `~/.codex/config.toml` 中为两个事件分别注册命令，并显式指定对应 Adapter：
+在用户级 `~/.codex/hooks.json` 的 `hooks` 对象中为两个事件分别注册命令，并显式指定对应 Adapter；保留文件中已有的其它事件：
 
-```toml
-[[hooks.PreToolUse]]
-matcher = ".*"
-hooks = [
-  { type = "command", command = "python3 /path/to/safety-guard/safety-guard.py --adapter codex-pretool" },
-]
-
-[[hooks.PermissionRequest]]
-matcher = ".*"
-hooks = [
-  { type = "command", command = "python3 /path/to/safety-guard/safety-guard.py --adapter codex-permission" },
-]
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 /path/to/safety-guard/safety-guard.py --adapter codex-pretool",
+            "timeout": 30,
+            "statusMessage": "Checking safety guard"
+          }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 /path/to/safety-guard/safety-guard.py --adapter codex-permission",
+            "timeout": 30,
+            "statusMessage": "Checking safety guard"
+          }
+        ]
+      }
+    ]
+  }
+}
 ```
 
 不要用全局 `SAFETY_GUARD_ADAPTER` 替代命令行参数；两个 Hook 的事件协议不同，显式参数不会影响 Claude 或 Grok Adapter。
 
 `matcher = ".*"` 让 Codex 当前支持的所有本地函数工具先经过 Adapter。截图、trace、network body 等显式输出路径复用文件写入规则；`upload_file` 根据路径位置和敏感性生成 ask/deny。无本机路径的已知工具直接继续，未知工具进入 reviewer，默认 `noop` 只返回 `abstain`。
 
-Codex `PreToolUse` 目前不支持 `ask`：medium 结果不升级为 deny，而是保持无决定；`PermissionRequest` 的无决定结果继续显示 Codex 原生审批。只有 reviewer 明确返回 allow 时，`codex-permission` 才会跳过原生审批。
+Codex `PreToolUse` 目前不支持 `ask`：medium 结果不升级为 deny，而是通过 `systemMessage` / `additionalContext` 提示风险，不输出授权或阻断决定；`PermissionRequest` 的 medium/abstain 继续交给 Codex 原生审批。reviewer 的 allow 同样按 abstain 处理，不能跳过原生审批。
 
 修改 Hook 定义后，在 Codex 中运行 `/hooks` 并重新信任变更；不要手动修改 `[hooks.state]` 的信任哈希。
 
@@ -187,7 +206,7 @@ python3 safety-guard.py --explain --tool Write --path ./README.md
 | `read_only_commands` | 只读命令白名单 |
 | `wrapper_commands` | 前缀包装（`rtk` / `sudo` / `env` …）；只加名字即可当纯前缀剥 |
 | `wrapper_specs.<name>` | 包装怎么剥：`value_opts` / `skip_positional` / `subcommands` |
-| `critical_paths` | 高危路径（**与默认自保合并**，不会丢掉入口脚本保护） |
+| `critical_paths` | 高危路径（与默认自保合并）；文件工具写入需确认，Bash 写删直接拒绝 |
 | `fail_open` / `dry_run` | 异常放行 / 只审计不拦截 |
 | `unknown_reviewer` / `reviewer_timeout_ms` | 未知工具 reviewer 名称与超时；默认 `noop` / 250ms |
 | `audit_include_body` | 是否把脱敏后的正文写入审计；默认 false |
@@ -207,7 +226,7 @@ python3 safety-guard.py --explain --tool Write --path ./README.md
 | `SAFETY_GUARD_NO_AUDIT=1` | 不写审计（测试/回放） |
 | `SAFETY_GUARD_IGNORE_DISABLED_RULES=1` | 忽略 `disabled_rules` |
 
-审计默认写在安装目录下 `audit/audit-YYYY-MM-DD.jsonl`，目录权限为 `0700`、日志文件权限为 `0600`。默认只保存 digest、字符数、行数、规则 id/severity 与决策，不保存命令、补丁、正文或 match 详情。只有显式启用 `audit_include_body` 才写脱敏正文；**不要提交真实审计**。
+审计默认写在安装目录下 `audit/audit-YYYY-MM-DD.jsonl`。新建目录使用 `0700`、日志文件使用 `0600`；既存目录若不是 `0700` 会拒绝写入，不会替用户改权限。轮转只管理带 Safety Guard schema 标记的日志。默认只保存 digest、字符数、行数、规则 id/severity 与决策，不保存命令、补丁、正文或 match 详情。只有显式启用 `audit_include_body` 才写脱敏正文；**不要提交真实审计**。
 
 `rendered_decision=abstain` 表示 Adapter 没有向平台输出显式决策。Claude/Codex 的策略 allow 不会替代原生权限流程；Grok 协议则把退出 0 且无输出视为 allow。
 

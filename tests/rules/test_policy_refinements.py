@@ -249,7 +249,25 @@ def test_critical_path_rule_follows_mocked_intermediate_symlink(
     match = FileCriticalPathWrite().match(ctx)
 
     assert match is not None
-    assert match.severity == "high"
+    assert match.severity == "medium"
+
+
+def test_critical_path_write_requires_confirmation(cwd: Path):
+    target = cwd / "protected.json"
+    cfg = replace(load_config(), critical_paths=(target,), fail_open=False)
+    request = NormalizedRequest(
+        adapter="claude",
+        event="PreToolUse",
+        tool="Edit",
+        operations=(Operation("Edit", {"file_path": str(target)}),),
+        cwd=str(cwd),
+        audit_input=str(target),
+    )
+
+    result = engine.evaluate(request, cfg)
+
+    assert result.decision == "ask"
+    assert "file-critical-path-write" in (result.reason or "")
 
 
 @pytest.mark.parametrize(
@@ -440,6 +458,28 @@ def test_deno_bun_value_options_do_not_hide_outside_script(
 def test_command_rules_use_actual_subcommands(bash, cwd: Path, command: str, expected: str):
     decision, reason = bash(command, cwd)
     assert decision == expected, reason
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        'git push --force origin "$SYNTHETIC_BRANCH"',
+        'git push --delete origin "$SYNTHETIC_BRANCH"',
+        "git push --force origin HEAD",
+    ],
+)
+def test_force_or_delete_with_unresolved_destination_denies(bash, cwd: Path, command: str):
+    decision, reason = bash(command, cwd)
+
+    assert decision == "deny", reason
+    assert "bash-git-push-force-protected" in (reason or "")
+
+
+def test_folded_non_protected_force_destination_still_asks(bash, cwd: Path):
+    decision, reason = bash("B=feature/synthetic; git push --force origin $B", cwd)
+
+    assert decision == "ask", reason
+    assert "bash-git-push" in (reason or "")
 
 
 @pytest.mark.parametrize(

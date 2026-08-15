@@ -7,7 +7,7 @@
 
     PATH=<dir> cat ./f      # AST 里 argv[0] 老实是 cat，实际跑的是 <dir>/cat
     LD_PRELOAD=<x.so> ls    # ls 还是 ls，但 x.so 的构造函数先于 main 执行
-    BASH_ENV=<f> sh -c ls   # 子 shell 启动时先 source <f>
+    BASH_ENV=<f> bash -c ls   # bash 子 shell 启动时先 source <f>
 
 即攻击者不需要模糊动词本身，只需要模糊动词的解析。这类注入让整套按名分发的
 规则集体失效，所以它是其它所有规则的地基，必须在它们之前判定。
@@ -25,8 +25,10 @@
 from __future__ import annotations
 
 import posixpath
+import re
 
 from ..context import BashContext
+from ..helpers import normalize_cmd_name
 from .base import Rule, RuleMatch
 from .registry import register
 
@@ -42,6 +44,38 @@ _SUBVERSIVE_ALWAYS = frozenset({
     # 改变 shell 自身行为（xtrace 展开会执行命令替换）
     "SHELLOPTS", "BASHOPTS", "PS4", "PROMPT_COMMAND",
 })
+
+_RUNTIME_LOADER_OPTIONS = {
+    "NODE_OPTIONS": re.compile(r"(?:^|\s)(?:-r|--require|--import|--loader)(?:=|\s|$)"),
+    "RUBYOPT": re.compile(r"(?:^|\s)(?:-r|--require)(?:=|\s|[^\s]*)"),
+    "PERL5OPT": re.compile(r"(?:^|\s)-[Mm](?:\s|[^\s]*)"),
+    "JAVA_TOOL_OPTIONS": re.compile(r"(?:^|\s)-(?:javaagent|agentlib|agentpath)(?::|=|\s|$)"),
+    "_JAVA_OPTIONS": re.compile(r"(?:^|\s)-(?:javaagent|agentlib|agentpath)(?::|=|\s|$)"),
+    "JDK_JAVA_OPTIONS": re.compile(r"(?:^|\s)-(?:javaagent|agentlib|agentpath)(?::|=|\s|$)"),
+}
+_RUNTIME_LOADER_TARGETS = {
+    "NODE_OPTIONS": frozenset({
+        "node", "npm", "npx", "yarn", "yarnpkg", "pnpm", "pnpx", "corepack",
+    }),
+    "RUBYOPT": frozenset({"ruby", "bundle", "bundler", "rake", "gem", "irb"}),
+    "PERL5OPT": frozenset({"perl", "cpan", "cpanm", "prove"}),
+    "JAVA_TOOL_OPTIONS": frozenset({
+        "java", "javac", "javadoc", "jshell", "jar", "jarsigner", "keytool",
+    }),
+    "_JAVA_OPTIONS": frozenset({
+        "java", "javac", "javadoc", "jshell", "jar", "jarsigner", "keytool",
+    }),
+    "JDK_JAVA_OPTIONS": frozenset({"java"}),
+}
+
+_SHELL_ENV_TARGETS = {
+    "BASH_ENV": frozenset({"bash"}),
+    "ENV": frozenset({"sh", "dash", "ksh", "ash"}),
+    "SHELLOPTS": frozenset({"bash"}),
+    "BASHOPTS": frozenset({"bash"}),
+    "PROMPT_COMMAND": frozenset({"bash"}),
+    "PS4": frozenset({"sh", "bash", "zsh", "dash", "ksh", "ash"}),
+}
 
 # 合法构建/运行时常见的库搜索路径仍需确认，但不应与注入 .so 同级 deny。
 _SUBVERSIVE_LIBRARY_PATHS = frozenset({
@@ -128,6 +162,14 @@ def _path_extension_level(value: str) -> str:
 def _classify(name: str, value: str) -> str | None:
     """返回命中的级别（'A'/'B'），未命中返回 None。"""
     if name in _SUBVERSIVE_ALWAYS:
+        if not value.strip():
+            return None
+        if name == "PS4" and not any(marker in value for marker in ("$(", "`")):
+            # 普通提示前缀不会自行执行命令；只有展开载荷才有注入语义。
+            return None
+        return "A"
+    loader = _RUNTIME_LOADER_OPTIONS.get(name)
+    if loader is not None and loader.search(value):
         return "A"
     if name in _SUBVERSIVE_LIBRARY_PATHS and value.strip():
         return _library_path_level(value)
@@ -147,6 +189,10 @@ def _classify(name: str, value: str) -> str | None:
     return None
 
 
+def _targets_for(name: str) -> frozenset[str] | None:
+    return _SHELL_ENV_TARGETS.get(name) or _RUNTIME_LOADER_TARGETS.get(name)
+
+
 @register
 class BashEnvSubversion(Rule):
     id = "bash-env-subversion"
@@ -157,6 +203,15 @@ class BashEnvSubversion(Rule):
     @staticmethod
     def _benign_assignment(cmd, assignment) -> bool:
         """仅豁免直接调用的普通 shell builtin；wrapper 仍可能经 PATH 启动。"""
+        name = str(getattr(cmd, "name", "") or "")
+        command_name = normalize_cmd_name(name)
+        targets = _targets_for(assignment.name)
+        if (
+            targets is not None
+            and getattr(assignment, "origin", "") in {"prefix", "wrapper"}
+            and command_name not in targets
+        ):
+            return True
         if getattr(assignment, "origin", "") != "prefix":
             return False
         if assignment.name == "PATH" and _path_list(assignment.value_raw)[1]:
@@ -170,7 +225,6 @@ class BashEnvSubversion(Rule):
         raw_name = str(getattr(words[0], "raw", ""))
         if "/" in raw_name:
             return False
-        name = str(getattr(cmd, "name", "") or "")
         return name in _PATH_INDEPENDENT_BUILTINS
 
     def match(self, ctx: BashContext) -> RuleMatch | None:

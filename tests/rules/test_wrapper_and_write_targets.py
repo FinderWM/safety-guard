@@ -125,6 +125,12 @@ def test_wrapper_records_prefix():
     assert ast.commands[0].wrappers == ("sudo", "rtk")
 
 
+def test_wrapper_unwrap_has_no_fixed_depth_bypass():
+    command = "sudo env nohup nice setsid timeout 5 git push --force origin main"
+
+    assert "git" in _names(command)
+
+
 def test_inline_shell_payload_expanded():
     assert "rm" in _names("bash -c 'rm -rf /tmp/x'")
     assert "git" in _names("sh -c 'git push --force origin main'")

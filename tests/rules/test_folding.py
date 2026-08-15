@@ -96,3 +96,17 @@ def test_quoted_offsets_do_not_corrupt_fold(bash, cwd: Path):
     decision, reason = bash('cat "$HOME"/.ssh_fake/id_rsa_fake', cwd)
     assert decision == "ask", f"{decision} ({reason})"
     assert "$/" not in (reason or ""), f"偏移错位：{reason}"
+
+
+def test_folded_argv_zero_reenters_command_rules(bash, cwd: Path):
+    decision, reason = bash("C=git; $C push --force origin main", cwd)
+
+    assert decision == "deny"
+    assert "bash-git-push-force-protected" in (reason or "")
+
+
+def test_folded_wrapper_and_command_are_both_unwrapped(bash, cwd: Path):
+    decision, reason = bash("W=env; C=git; $W $C push --force origin main", cwd)
+
+    assert decision == "deny"
+    assert "bash-git-push-force-protected" in (reason or "")

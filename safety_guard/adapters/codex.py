@@ -348,21 +348,17 @@ class CodexAdapter:
         # 未命中规则不等于获得授权；PermissionRequest 也必须保留 Codex 原生审批。
         decision = project_decision(result, self.capabilities)
         if decision == "abstain":
+            if self.event == _PRETOOL_EVENT and result.decision == "ask":
+                warning = result.reason or "Safety Guard 检测到需要确认的操作，请在执行前核对其影响。"
+                return {
+                    "systemMessage": warning,
+                    "hookSpecificOutput": {
+                        "hookEventName": _PRETOOL_EVENT,
+                        "additionalContext": warning,
+                    },
+                }
             return {}
         if decision == "allow":
-            # 只有显式 reviewer allow 才跳过 PermissionRequest 原生审批；策略层的
-            # allow 仍保持空输出，避免安全规则变成平台授权替代品。
-            if (
-                self.event == _PERMISSION_EVENT
-                and result.decision_source == "reviewer"
-                and result.resolved_engine_decision() == "allow"
-            ):
-                return {
-                    "hookSpecificOutput": {
-                        "hookEventName": _PERMISSION_EVENT,
-                        "decision": {"behavior": "allow"},
-                    }
-                }
             return {}
         if self.event == _PRETOOL_EVENT:
             output: dict[str, Any] = {

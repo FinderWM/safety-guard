@@ -18,10 +18,15 @@ class BashParseError(Exception):
     """bashlex 解析失败的封装异常。"""
 
 
+_MAX_EXPANSION_DEPTH = 8
+
+
 def _cmd_name(word: WordSpec | None = None, *, raw: str | None = None) -> str:
     """从 word 取规范化 argv[0]（去 /usr/bin/ 前缀）。"""
     if word is not None:
-        text = word.literal if word.literal is not None else word.raw
+        text = word.folded if word.folded is not None else word.literal
+        if text is None:
+            text = word.raw
         return normalize_cmd_name(text or "")
     return normalize_cmd_name(raw or "")
 
@@ -107,12 +112,13 @@ class OpaquePayload:
       inline-script  — sh -c / eval / python -c 的动态载荷
       process-subst  — bash <(curl …) / source <(…) 把进程替换当脚本源
       find-exec      — find -exec/-execdir 运行时拼出的子命令
+      command-slot   — ProxyCommand / sed e 等命令槽的载荷无法静态确定
       placeholder    — xargs sh -c '{}' 这类占位符，静态层看不见真实内层
     """
     shell: str        # 承载载荷的 shell/解释器名（sh / bash / find / xargs ...）
     raw: str          # 载荷原文
     command_raw: str  # 所属命令的完整原文
-    kind: str = "inline-script"  # inline-script | process-subst | find-exec | placeholder
+    kind: str = "inline-script"
 
 
 @dataclass
@@ -210,9 +216,6 @@ def merge_wrapper_specs(user: dict | None) -> dict[str, WrapperSpec]:
             subcommands=frozenset(subs) if subs is not None else base.subcommands,
         )
     return out
-
-_MAX_UNWRAP_DEPTH = 4
-
 
 def _words_from_shell_string(text: str) -> list[WordSpec] | None:
     """把 env -S 的字面载荷拆成 WordSpec 列表；失败返回 None。"""
@@ -377,7 +380,12 @@ def unwrap_command(
 ) -> CommandSpec:
     """反复剥掉包装前缀，直到 argv[0] 是真命令（如 `sudo env A=1 rtk rm`）。"""
     current = cmd
-    for _ in range(_MAX_UNWRAP_DEPTH):
+    seen: set[tuple[str, tuple[str, ...]]] = set()
+    while True:
+        state = (normalize_cmd_name(current.name), tuple(w.raw for w in current.words))
+        if state in seen:
+            break
+        seen.add(state)
         nxt = _unwrap_once(current, wrappers, specs)
         if nxt is None:
             break
@@ -618,6 +626,19 @@ def _collect_structural_opaque(cmd: CommandSpec) -> list[OpaquePayload]:
     """
     found: list[OpaquePayload] = []
     found.extend(_collect_env_s_opaque(cmd))
+    if (
+        cmd.words
+        and cmd.words[0].has_expansion
+        and cmd.words[0].folded is None
+    ):
+        found.append(
+            OpaquePayload(
+                shell="argv[0]",
+                raw=cmd.words[0].raw,
+                command_raw=cmd.raw,
+                kind="command-slot",
+            )
+        )
     name = normalize_cmd_name(cmd.name)
     if name in _PROCESS_SUBST_SCRIPT_HOSTS:
         for w in cmd.words[1:]:
@@ -689,15 +710,347 @@ def _collect_structural_opaque(cmd: CommandSpec) -> list[OpaquePayload]:
     return found
 
 
+@dataclass(frozen=True)
+class _CommandSlot:
+    """A deterministic command-bearing argument exposed by another program."""
+
+    carrier: str
+    command: CommandSpec | None = None
+    script: str | None = None
+    opaque_raw: str | None = None
+
+
+def _known_word_text(word: WordSpec) -> str | None:
+    if word.folded is not None:
+        return word.folded
+    return word.literal
+
+
+def _command_slot_from_words(
+    carrier: str,
+    words: list[WordSpec],
+    owner: CommandSpec,
+) -> _CommandSlot | None:
+    if not words:
+        return None
+    if _known_word_text(words[0]) is None:
+        return _CommandSlot(carrier=carrier, opaque_raw=" ".join(w.raw for w in words))
+    tokens = [_known_word_text(word) or word.raw for word in words]
+    command = _command_from_tokens(tokens)
+    if command is None:
+        return None
+    command.raw = " ".join(tokens)
+    command.wrappers = owner.wrappers + (carrier,)
+    return _CommandSlot(carrier=carrier, command=command)
+
+
+def _find_command_slots(cmd: CommandSpec) -> list[_CommandSlot]:
+    slots: list[_CommandSlot] = []
+    args = list(cmd.args)
+    for index, word in enumerate(args):
+        if word.raw not in ("-exec", "-execdir"):
+            continue
+        tail: list[WordSpec] = []
+        for item in args[index + 1:]:
+            if item.raw in (";", "+"):
+                break
+            tail.append(item)
+        slot = _command_slot_from_words("find-exec", tail, cmd)
+        if slot is not None:
+            slots.append(slot)
+    return slots
+
+
+_GIT_ALIAS_VALUE_OPTIONS = frozenset({
+    "-C", "--git-dir", "--work-tree", "--namespace", "--super-prefix", "--config-env",
+})
+
+
+def _git_alias_assignment(word: WordSpec, *, attached: bool = False) -> tuple[str, str, bool] | None:
+    known = _known_word_text(word)
+    text = known if known is not None else word.raw
+    if attached:
+        text = text[2:]
+    if not text.startswith("alias.") or "=" not in text:
+        return None
+    key, value = text.split("=", 1)
+    alias = key.removeprefix("alias.")
+    if not alias:
+        return None
+    return alias, value, known is not None
+
+
+def _git_alias_slots(cmd: CommandSpec) -> list[_CommandSlot]:
+    aliases: dict[str, tuple[str, bool]] = {}
+    args = list(cmd.args)
+    index = 0
+    subcommand: str | None = None
+    while index < len(args):
+        word = args[index]
+        text = _known_word_text(word) or word.raw
+        if text in {"--help", "-h", "--version", "-v"}:
+            return []
+        if text == "-c":
+            if index + 1 < len(args):
+                parsed = _git_alias_assignment(args[index + 1])
+                if parsed is not None:
+                    alias, value, known = parsed
+                    aliases[alias] = (value, known)
+            index += 2
+            continue
+        if text.startswith("-c") and text != "-c":
+            parsed = _git_alias_assignment(word, attached=True)
+            if parsed is not None:
+                alias, value, known = parsed
+                aliases[alias] = (value, known)
+            index += 1
+            continue
+        if text in _GIT_ALIAS_VALUE_OPTIONS:
+            index += 2
+            continue
+        if text.startswith("--") and "=" in text:
+            index += 1
+            continue
+        if text.startswith("-") and text != "-":
+            index += 1
+            continue
+        subcommand = text
+        break
+
+    if subcommand is None or subcommand not in aliases:
+        return []
+    value, known = aliases[subcommand]
+    if not known:
+        return [_CommandSlot(carrier="git-alias", opaque_raw=value)]
+    if value.startswith("!"):
+        payload = value[1:].strip()
+        if not payload:
+            return [_CommandSlot(carrier="git-alias", opaque_raw=value)]
+        return [_CommandSlot(carrier="git-alias", script=payload)]
+    try:
+        alias_args = shlex.split(value, posix=True)
+    except ValueError:
+        return [_CommandSlot(carrier="git-alias", opaque_raw=value)]
+    words = [_token_word("git"), *(_token_word(token) for token in alias_args)]
+    slot = _command_slot_from_words("git-alias", words, cmd)
+    return [slot] if slot is not None else []
+
+
+def _proxy_command_value(text: str) -> str | None:
+    stripped = text.strip()
+    if "=" in stripped:
+        key, value = stripped.split("=", 1)
+    else:
+        key, separator, value = stripped.partition(" ")
+        if not separator:
+            return None
+    if key.strip().lower() != "proxycommand":
+        return None
+    return value.strip()
+
+
+def _ssh_proxy_slots(cmd: CommandSpec) -> list[_CommandSlot]:
+    slots: list[_CommandSlot] = []
+    args = list(cmd.args)
+    index = 0
+    while index < len(args):
+        word = args[index]
+        raw = word.raw
+        option_word: WordSpec | None = None
+        attached = False
+        if raw == "-o" and index + 1 < len(args):
+            option_word = args[index + 1]
+            index += 2
+        elif raw.startswith("-o") and raw != "-o":
+            option_word = _token_word(raw[2:])
+            attached = True
+            index += 1
+        else:
+            index += 1
+        if option_word is None:
+            continue
+        known = _known_word_text(option_word)
+        text = known if known is not None else option_word.raw
+        value = _proxy_command_value(text)
+        if value is None or value.lower() == "none":
+            continue
+        carrier = "ssh-proxycommand"
+        if known is None and not attached:
+            slots.append(_CommandSlot(carrier=carrier, opaque_raw=text))
+        elif known is None:
+            slots.append(_CommandSlot(carrier=carrier, opaque_raw=raw))
+        elif value:
+            slots.append(_CommandSlot(carrier=carrier, script=value))
+        else:
+            slots.append(_CommandSlot(carrier=carrier, opaque_raw=text))
+    return slots
+
+
+def _tar_checkpoint_slots(cmd: CommandSpec) -> list[_CommandSlot]:
+    slots: list[_CommandSlot] = []
+    args = list(cmd.args)
+    index = 0
+    while index < len(args):
+        word = args[index]
+        raw = word.raw
+        action_word: WordSpec | None = None
+        if raw == "--checkpoint-action" and index + 1 < len(args):
+            action_word = args[index + 1]
+            index += 2
+        elif raw.startswith("--checkpoint-action="):
+            action_word = _token_word(raw.split("=", 1)[1])
+            if word.folded is not None and word.folded.startswith("--checkpoint-action="):
+                action_word.folded = word.folded.split("=", 1)[1]
+            elif word.literal is None:
+                action_word.literal = None
+                action_word.has_expansion = True
+            index += 1
+        else:
+            index += 1
+        if action_word is None:
+            continue
+        known = _known_word_text(action_word)
+        text = known if known is not None else action_word.raw
+        if not text.startswith("exec="):
+            continue
+        payload = text.removeprefix("exec=").strip()
+        carrier = "tar-checkpoint-exec"
+        if known is None or not payload:
+            slots.append(_CommandSlot(carrier=carrier, opaque_raw=text))
+        else:
+            slots.append(_CommandSlot(carrier=carrier, script=payload))
+    return slots
+
+
+_SED_E_COMMAND_RE = re.compile(
+    r"^\s*(?:(?:\d+|\$|/.*?/)\s*)?e(?:[ \t]+(?P<command>.*))?$"
+)
+
+
+def _consume_sed_field(text: str, start: int, delimiter: str) -> int | None:
+    escaped = False
+    for index in range(start, len(text)):
+        char = text[index]
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\":
+            escaped = True
+            continue
+        if char == delimiter:
+            return index + 1
+    return None
+
+
+def _sed_substitution_exec(program: str) -> bool:
+    for segment in re.split(r"[;\n]", program):
+        text = segment.strip()
+        text = re.sub(r"^(?:\d+|\$|/.*?/)\s*", "", text, count=1)
+        if len(text) < 2 or text[0] != "s":
+            continue
+        delimiter = text[1]
+        first = _consume_sed_field(text, 2, delimiter)
+        if first is None:
+            continue
+        second = _consume_sed_field(text, first, delimiter)
+        if second is None:
+            continue
+        parts = text[second:].strip().split(maxsplit=1)
+        flags = parts[0] if parts else ""
+        if "e" in flags:
+            return True
+    return False
+
+
+def _sed_script_words(cmd: CommandSpec) -> list[WordSpec]:
+    scripts: list[WordSpec] = []
+    args = list(cmd.args)
+    index = 0
+    explicit = False
+    while index < len(args):
+        word = args[index]
+        raw = word.raw
+        if raw in ("-e", "--expression") and index + 1 < len(args):
+            scripts.append(args[index + 1])
+            explicit = True
+            index += 2
+            continue
+        if raw.startswith("--expression="):
+            scripts.append(_token_word(raw.split("=", 1)[1]))
+            explicit = True
+            index += 1
+            continue
+        if raw.startswith("-e") and raw != "-e":
+            scripts.append(_token_word(raw[2:]))
+            explicit = True
+            index += 1
+            continue
+        if raw in ("-f", "--file"):
+            index += 2
+            continue
+        if raw.startswith("-") and raw != "-":
+            index += 1
+            continue
+        if not explicit:
+            scripts.append(word)
+        break
+    return scripts
+
+
+def _sed_exec_slots(cmd: CommandSpec) -> list[_CommandSlot]:
+    slots: list[_CommandSlot] = []
+    for word in _sed_script_words(cmd):
+        known = _known_word_text(word)
+        if known is None:
+            slots.append(_CommandSlot(carrier="sed-exec", opaque_raw=word.raw))
+            continue
+        for line in known.splitlines() or [known]:
+            match = _SED_E_COMMAND_RE.fullmatch(line)
+            if match is None:
+                continue
+            payload = (match.group("command") or "").strip()
+            if payload:
+                slots.append(_CommandSlot(carrier="sed-exec", script=payload))
+            else:
+                slots.append(_CommandSlot(carrier="sed-exec", opaque_raw=line))
+        if _sed_substitution_exec(known):
+            slots.append(_CommandSlot(carrier="sed-substitute-exec", opaque_raw=known))
+    return slots
+
+
+def _secondary_command_slots(cmd: CommandSpec) -> list[_CommandSlot]:
+    name = normalize_cmd_name(cmd.name)
+    if name == "find":
+        return _find_command_slots(cmd)
+    if name == "git":
+        return _git_alias_slots(cmd)
+    if name in {"ssh", "scp", "sftp"}:
+        return _ssh_proxy_slots(cmd)
+    if name == "tar":
+        return _tar_checkpoint_slots(cmd)
+    if name == "sed":
+        return _sed_exec_slots(cmd)
+    return []
+
+
 def expand(
     ast: BashAst,
     wrappers: frozenset[str],
     specs: dict[str, WrapperSpec] | None = None,
+    *,
+    _depth: int = 0,
 ) -> BashAst:
     """展开包装前缀 + 内联 shell 脚本，返回规则可直接消费的 AST。
 
     原地重建 commands / pipelines.stages，使两者指向同一批 CommandSpec。
     """
+    from .folding import fold_ast
+
+    # Reveal deterministic argv[0] values before wrapper dispatch. Without this
+    # pass `C=git; $C push ...` and `$WRAPPER $COMMAND ...` never re-enter the
+    # command-name rules.
+    fold_ast(ast)
+
     unwrapped: dict[int, CommandSpec] = {}
 
     def _u(c: CommandSpec) -> CommandSpec:
@@ -709,7 +1062,8 @@ def expand(
     commands = [_u(c) for c in ast.commands]
     pipelines = [PipelineSpec(stages=[_u(s) for s in p.stages], raw=p.raw) for p in ast.pipelines]
 
-    # bash -c '<inner>' 递归展开一层（再深就不追了，避免 quoting 噩梦）
+    # bash -c '<inner>' 与确定性命令槽递归展开；预算耗尽或子载荷解析失败时
+    # 转为 opaque，避免静默漏检，也不把静态不确定性升级成 high deny。
     extra: list[CommandSpec] = []
     extra_redirects: list[RedirectSpec] = []
     # 内层的 pipeline 结构必须一起并进来。只并 commands 会让按 pipeline 判定的规则
@@ -717,21 +1071,93 @@ def expand(
     # bash-pipe-to-shell 看不到管道，整条 allow——一个包装前缀就摘掉一条 HIGH。
     extra_pipelines: list[PipelineSpec] = []
     opaque: list[OpaquePayload] = list(ast.opaque_payloads)
+
+    def merge(sub: BashAst) -> None:
+        extra.extend(sub.commands)
+        extra_redirects.extend(sub.redirects)
+        extra_pipelines.extend(sub.pipelines)
+        opaque.extend(sub.opaque_payloads)
+
     for c in commands:
         literals, unresolvable = _inline_script_payloads(c)
         opaque.extend(unresolvable)
         opaque.extend(_collect_structural_opaque(c))
-        for payload in literals:
-            try:
-                sub = expand(parse(payload), wrappers, specs)
-            except (BashParseError, RecursionError):
+        slots = _secondary_command_slots(c)
+        for slot in slots:
+            if slot.opaque_raw is not None:
+                opaque.append(
+                    OpaquePayload(
+                        shell=slot.carrier,
+                        raw=slot.opaque_raw,
+                        command_raw=c.raw,
+                        kind="command-slot",
+                    )
+                )
                 continue
-            extra.extend(sub.commands)
-            extra_redirects.extend(sub.redirects)
-            extra_pipelines.extend(sub.pipelines)
-            opaque.extend(sub.opaque_payloads)
+            if slot.command is not None:
+                if _depth >= _MAX_EXPANSION_DEPTH:
+                    opaque.append(
+                        OpaquePayload(
+                            shell=slot.carrier,
+                            raw=slot.command.raw,
+                            command_raw=c.raw,
+                            kind="command-slot",
+                        )
+                    )
+                    continue
+                child = BashAst(
+                    raw=slot.command.raw,
+                    commands=[slot.command],
+                    pipelines=[],
+                    redirects=list(slot.command.redirects),
+                )
+                try:
+                    merge(expand(child, wrappers, specs, _depth=_depth + 1))
+                except (BashParseError, RecursionError):
+                    opaque.append(
+                        OpaquePayload(
+                            shell=slot.carrier,
+                            raw=slot.command.raw,
+                            command_raw=c.raw,
+                            kind="command-slot",
+                        )
+                    )
+                continue
+            if slot.script is not None:
+                if _depth >= _MAX_EXPANSION_DEPTH:
+                    opaque.append(
+                        OpaquePayload(
+                            shell=slot.carrier,
+                            raw=slot.script,
+                            command_raw=c.raw,
+                            kind="command-slot",
+                        )
+                    )
+                else:
+                    literals.append(slot.script)
 
-    from .folding import fold_ast
+        for payload in literals:
+            if _depth >= _MAX_EXPANSION_DEPTH:
+                opaque.append(
+                    OpaquePayload(
+                        shell=normalize_cmd_name(c.name) or "inline-script",
+                        raw=payload,
+                        command_raw=c.raw,
+                    )
+                )
+                continue
+            try:
+                sub = expand(parse(payload), wrappers, specs, _depth=_depth + 1)
+            except (BashParseError, RecursionError):
+                opaque.append(
+                    OpaquePayload(
+                        shell=normalize_cmd_name(c.name) or "inline-script",
+                        raw=payload,
+                        command_raw=c.raw,
+                    )
+                )
+                continue
+            merge(sub)
 
     result = BashAst(
         raw=ast.raw,

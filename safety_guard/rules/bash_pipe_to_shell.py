@@ -35,18 +35,23 @@ class BashPipeToShell(Rule):
             if not is_pipeline_exec_sink(sink):
                 continue
             last_label = pipeline_sink_label(sink)
-            first = stages[0]
+            sources = stages[:-1]
+            first = sources[0]
             first_name = normalize_cmd_name(first.name)
-            # 模式 1：网络抓取在管道头（中间可夹 tee/sed）
-            if is_net_fetcher_name(first.name):
+            # 模式 1：执行端之前任一 stage 从网络取指。只看管道头会漏掉
+            # `printf ... | curl ... | sh`，而 shell 实际执行的仍是 curl 输出。
+            fetcher = next((stage for stage in sources if is_net_fetcher_name(stage.name)), None)
+            if fetcher is not None:
+                fetcher_name = normalize_cmd_name(fetcher.name)
                 return RuleMatch(
                     rule_id=self.id,
                     severity=self.severity,
                     reason=(
-                        f"拒绝执行：`{ctx.raw_command}` 是 `{first_name} … | {last_label}` 模式，"
+                        f"拒绝执行：`{ctx.raw_command}` 在执行端前包含 "
+                        f"`{fetcher_name} … | {last_label}` 模式，"
                         f"等同于直接执行远端任意代码。先下载到本地审查后再运行。"
                     ),
-                    extra={"first": first_name, "last": last_label},
+                    extra={"first": first_name, "fetcher": fetcher_name, "last": last_label},
                 )
             # 模式 2：管道里出现 base64 解码再喂执行端
             mid = [normalize_cmd_name(s.name) for s in stages[:-1]]
