@@ -24,7 +24,9 @@ _FAIL_OPEN_ENV = "SAFETY_GUARD_FAIL_OPEN"
 _DRY_RUN_ENV = "SAFETY_GUARD_DRY_RUN"
 _AUDIT_INCLUDE_BODY_ENV = "SAFETY_GUARD_AUDIT_INCLUDE_BODY"
 ConfigLoadError = Literal["config_read_error", "config_parse_error", "config_invalid"]
+CodexApprovalMode = Literal["off", "native-gap", "always"]
 _ALLOWED_SEVERITIES = frozenset({"medium", "high"})
+_CODEX_APPROVAL_MODES = frozenset({"off", "native-gap", "always"})
 
 
 def _install_root() -> Path:
@@ -96,6 +98,8 @@ def _defaults() -> dict:
         "audit_include_body": False,
         "unknown_reviewer": "noop",
         "reviewer_timeout_ms": 250,
+        "codex_approval_mode": "off",
+        "codex_approval_timeout_seconds": 25,
         # audit 目录默认在安装根目录下，跟随 hook 一起迁移
         "audit_dir": str(_install_root() / "audit"),
         "audit_retention_days": 7,
@@ -125,6 +129,9 @@ class Config:
     # 带默认值，保证 load() 未显式传入时也能构造（避免改配置时把 hook 锁死）
     wrapper_commands: frozenset[str] = frozenset(_bash_ast.DEFAULT_WRAPPERS)
     wrapper_specs: dict[str, WrapperSpec] = field(default_factory=lambda: dict(_bash_ast.DEFAULT_WRAPPER_SPECS))
+    # 放在旧的默认字段之后，保持旧版 Config 位置参数构造兼容。
+    codex_approval_mode: CodexApprovalMode = "off"
+    codex_approval_timeout_seconds: int = 25
 
 
 def _expand_path(p: str) -> Path:
@@ -206,10 +213,14 @@ def _validate_raw(raw: dict) -> None:
     reviewer = raw.get("unknown_reviewer")
     if not isinstance(reviewer, str) or not reviewer.strip():
         raise ValueError("unknown_reviewer must be a non-empty string")
+    approval_mode = raw.get("codex_approval_mode")
+    if approval_mode not in _CODEX_APPROVAL_MODES:
+        raise ValueError("codex_approval_mode must be off, native-gap, or always")
     audit_dir = raw.get("audit_dir")
     if not isinstance(audit_dir, str) or not audit_dir.strip():
         raise ValueError("audit_dir must be a non-empty string")
     _int_value(raw, "reviewer_timeout_ms", minimum=1)
+    _int_value(raw, "codex_approval_timeout_seconds", minimum=1)
     _int_value(raw, "audit_retention_days", minimum=0)
     _int_value(raw, "audit_max_file_mb", minimum=1)
     _int_value(raw, "audit_max_total_mb", minimum=1)
@@ -238,6 +249,8 @@ def _minimal_config() -> Config:
         audit_include_body=False,
         unknown_reviewer="noop",
         reviewer_timeout_ms=250,
+        codex_approval_mode="off",
+        codex_approval_timeout_seconds=25,
         audit_dir=root / "audit",
         audit_retention_days=7,
         audit_max_file_mb=5,
@@ -308,6 +321,8 @@ def _load(path: Path | None = None) -> Config:
         audit_include_body=_bool_value(raw, "audit_include_body"),
         unknown_reviewer=str(raw.get("unknown_reviewer") or "noop"),
         reviewer_timeout_ms=_int_value(raw, "reviewer_timeout_ms", minimum=1),
+        codex_approval_mode=raw["codex_approval_mode"],
+        codex_approval_timeout_seconds=_int_value(raw, "codex_approval_timeout_seconds", minimum=1),
         audit_dir=_expand_path(raw["audit_dir"]),
         audit_retention_days=_int_value(raw, "audit_retention_days", minimum=0),
         audit_max_file_mb=_int_value(raw, "audit_max_file_mb", minimum=1),

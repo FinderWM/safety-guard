@@ -8,6 +8,7 @@ from typing import Any
 from . import audit, engine
 from .adapters.base import Adapter, safe_tool_label
 from .adapters import fields
+from .adapters.codex_approval import ApprovalResolver, resolve_codex_ask
 from .adapters.registry import select
 from .config import Config, load as load_config
 from .contracts import DecisionResult, NormalizedRequest
@@ -111,6 +112,8 @@ def _emit_audit(
             error_detail=result.error_detail,
             classification=classification,
             review=review,
+            approval=result.approval,
+            decision_source=result.decision_source,
         )
     except Exception:
         pass
@@ -122,6 +125,7 @@ def run(
     adapter: Adapter | None = None,
     config: Config | None = None,
     reviewer: Reviewer | None = None,
+    approval_resolver: ApprovalResolver | None = None,
 ) -> dict[str, Any]:
     """执行一次 Hook 请求并返回目标平台的原生输出。"""
     selected = adapter or select()
@@ -166,6 +170,14 @@ def run(
         return {}
 
     result = engine.evaluate(request, cfg, reviewer=reviewer)
+    result = resolve_codex_ask(
+        stdin_json=stdin_json,
+        adapter_name=selected.name,
+        request=request,
+        result=result,
+        config=cfg,
+        resolver=approval_resolver,
+    )
     output = selected.render(result)
     _emit_audit(
         cfg=cfg,

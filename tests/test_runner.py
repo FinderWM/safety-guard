@@ -62,6 +62,8 @@ def test_example_config_is_valid_and_keeps_all_rules_enabled():
     assert cfg.load_error is None
     assert cfg.disabled_rules == ()
     assert cfg.fail_open is False
+    assert cfg.codex_approval_mode == "off"
+    assert cfg.codex_approval_timeout_seconds == 25
 
 
 @pytest.mark.parametrize(
@@ -70,6 +72,8 @@ def test_example_config_is_valid_and_keeps_all_rules_enabled():
         'fail_open = "false"\n',
         'protected_branches = "main"\n',
         '[severity_overrides]\nbash-rm-targeted = "low"\n',
+        'codex_approval_mode = "unsupported"\n',
+        "codex_approval_timeout_seconds = 0\n",
     ],
 )
 def test_invalid_safety_types_fall_back_to_fail_closed(

@@ -148,7 +148,7 @@ cp safety_guard.toml.example safety_guard.toml
 
 `matcher = ".*"` 让 Codex 当前支持的所有本地函数工具先经过 Adapter。截图、trace、network body 等显式输出路径复用文件写入规则；`upload_file` 根据路径位置和敏感性生成 ask/deny。无本机路径的已知工具直接继续，未知工具进入 reviewer，默认 `noop` 只返回 `abstain`。
 
-Codex `PreToolUse` 目前不支持 `ask`：medium 结果不升级为 deny，而是通过 `systemMessage` / `additionalContext` 提示风险，不输出授权或阻断决定；`PermissionRequest` 的 medium/abstain 继续交给 Codex 原生审批。reviewer 的 allow 同样按 abstain 处理，不能跳过原生审批。
+Codex `PreToolUse` 目前不支持 `ask`：默认仍通过 `systemMessage` / `additionalContext` 提示风险。若在 `safety_guard.toml` 设置 `codex_approval_mode = "native-gap"`，则仅当 Codex 的 `permission_mode` 为 `dontAsk` 或 `bypassPermissions` 时由本机同步确认框接管 medium ask；批准时内部结果转为本次 `allow`，Hook 对外返回空对象继续调用，拒绝、取消、超时或无法显示确认框均输出 `deny`。`PermissionRequest` 始终保留 Codex 原生审批，Claude/Grok 不受影响。
 
 修改 Hook 定义后，在 Codex 中运行 `/hooks` 并重新信任变更；不要手动修改 `[hooks.state]` 的信任哈希。
 
@@ -209,6 +209,7 @@ python3 safety-guard.py --explain --tool Write --path ./README.md
 | `critical_paths` | 高危路径（与默认自保合并）；文件工具写入需确认，Bash 写删直接拒绝 |
 | `fail_open` / `dry_run` | 异常放行 / 只审计不拦截 |
 | `unknown_reviewer` / `reviewer_timeout_ms` | 未知工具 reviewer 名称与超时；默认 `noop` / 250ms |
+| `codex_approval_mode` / `codex_approval_timeout_seconds` | Codex medium ask 的同步确认：`off` / `native-gap` / `always`；默认 `off` / 25 秒 |
 | `audit_include_body` | 是否把脱敏后的正文写入审计；默认 false |
 | `audit_*` | 审计目录与保留策略 |
 
@@ -228,7 +229,7 @@ python3 safety-guard.py --explain --tool Write --path ./README.md
 
 审计默认写在安装目录下 `audit/audit-YYYY-MM-DD.jsonl`。新建目录使用 `0700`、日志文件使用 `0600`；既存目录若不是 `0700` 会拒绝写入，不会替用户改权限。轮转只管理带 Safety Guard schema 标记的日志。默认只保存 digest、字符数、行数、规则 id/severity 与决策，不保存命令、补丁、正文或 match 详情。只有显式启用 `audit_include_body` 才写脱敏正文；**不要提交真实审计**。
 
-`rendered_decision=abstain` 表示 Adapter 没有向平台输出显式决策。Claude/Codex 的策略 allow 不会替代原生权限流程；Grok 协议则把退出 0 且无输出视为 allow。
+`rendered_decision=abstain` 表示 Adapter 没有向平台输出显式决策。Claude/Codex 的策略 allow 不会替代原生权限流程；Grok 协议则把退出 0 且无输出视为 allow。Codex 同步审批批准后也按官方协议返回空输出，审计用 `approval.status=approved` 与 `decision_source=interactive` 表示人工批准。
 
 ## 调试与回归
 

@@ -250,7 +250,7 @@ python3 safety-guard.py --adapter grok
 ### Codex 渲染
 
 - `allow` / `abstain` → `{}`；策略 allow 不等于平台授权
-- `ask` + PreToolUse → `systemMessage` + `additionalContext`，只提示风险，不输出授权或阻断决定
+- `ask` + PreToolUse → 默认 `systemMessage` + `additionalContext`；配置 `codex_approval_mode = "native-gap"` 且 `permission_mode` 为 `dontAsk` / `bypassPermissions` 时进入本机同步确认框，批准时内部结果为 `allow`、对外返回空输出，其它结果为 `deny`
 - `ask` + PermissionRequest → `{}`，保留 Codex 原生审批
 - `deny` → 对应事件的原生 deny 结构
 - reviewer 的 allow → 按 `abstain` 处理，不能替代任一事件的原生授权
@@ -309,8 +309,13 @@ Codex 的 `PreToolUse` 与 `PermissionRequest` matcher 均使用 `.*`，使所�
 | `hook_event` | 规范化事件名 |
 | `classification` | `modeled` / `known-noop` / `unknown` |
 | `review` | reviewer 名称、状态与无敏感详情的错误类型 |
+| `approval` | Codex 同步审批 provider、状态、模式、`permission_mode` 与原始决策来源 |
+| `decision_source` | 最终决策来源；同步人工审批为 `interactive` |
 | `matches` | 默认仅规则 id/severity；正文审计开启后才含 reason/extra |
 | `config_load_error` | 配置读取、解析或校验失败的类型（不含底层异常详情） |
+
+Codex 人工批准后按官方协议返回空输出，所以 `rendered_decision=abstain` 是预期值；
+应结合 `approval.status=approved` 与 `decision_source=interactive` 判断人工结果。
 
 `tools/replay.py` 只有在审计显式保存 `cmd_body` 时才能精确回放，并与
 `engine_decision` 对比。
@@ -548,6 +553,7 @@ cp safety_guard.toml.example safety_guard.toml
 | `critical_paths` | 高危路径（与默认自保合并）；文件工具 ask，Bash 写删 deny |
 | `fail_open` / `dry_run` | 行为开关 |
 | `unknown_reviewer` / `reviewer_timeout_ms` | 未知工具 reviewer 与超时 |
+| `codex_approval_mode` / `codex_approval_timeout_seconds` | Codex medium ask 同步确认模式与超时：`off` / `native-gap` / `always` |
 | `audit_include_body` | 是否保存脱敏正文，默认 false |
 | `audit_dir` / `audit_retention_days` / `audit_max_*_mb` | 审计 |
 

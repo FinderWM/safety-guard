@@ -7,7 +7,7 @@ from typing import Any, Literal
 
 Decision = Literal["allow", "deny", "ask", "abstain"]
 RequestClassification = Literal["modeled", "known-noop", "unknown"]
-DecisionSource = Literal["policy", "reviewer", "internal"]
+DecisionSource = Literal["policy", "reviewer", "internal", "interactive"]
 
 
 @dataclass(frozen=True)
@@ -52,6 +52,7 @@ class DecisionResult:
     error_detail: str | None = None
     review: dict[str, Any] = field(default_factory=dict)
     decision_source: DecisionSource = "policy"
+    approval: dict[str, Any] = field(default_factory=dict)
 
     def resolved_engine_decision(self) -> Decision:
         return self.engine_decision or self.decision

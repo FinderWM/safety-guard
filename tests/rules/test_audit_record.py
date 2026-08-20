@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 
 from safety_guard import audit, runner
+from safety_guard.adapters.codex_approval import ApprovalOutcome
 from safety_guard.adapters.registry import get
 from safety_guard.config import load as load_config
 
@@ -107,6 +108,48 @@ def test_codex_permission_dry_run_records_native_abstain(audit_cfg, tmp_path: Pa
     record = _read_all(cfg.audit_dir)[0]
     assert record["decision"] == "dry-run-allow"
     assert record["rendered_decision"] == "abstain"
+
+
+@pytest.mark.parametrize(
+    ("status", "rendered_decision"),
+    [("approved", "abstain"), ("denied", "deny")],
+)
+def test_codex_interactive_approval_is_audited(
+    audit_cfg,
+    tmp_path: Path,
+    status: str,
+    rendered_decision: str,
+):
+    class Resolver:
+        def resolve(self, request, result, *, timeout_seconds):
+            return ApprovalOutcome(status, provider="synthetic-dialog")
+
+    cwd = tmp_path / "proj"
+    cwd.mkdir()
+    runner.run(
+        {
+            "hook_event_name": "PreToolUse",
+            "permission_mode": "bypassPermissions",
+            "tool_name": "Bash",
+            "tool_input": {"command": "rm -rf ./synthetic-dir"},
+            "cwd": str(cwd),
+        },
+        adapter=get("codex-pretool"),
+        config=replace(audit_cfg, codex_approval_mode="native-gap"),
+        approval_resolver=Resolver(),
+    )
+
+    record = _read_all(audit_cfg.audit_dir)[0]
+    assert record["engine_decision"] == "ask"
+    assert record["rendered_decision"] == rendered_decision
+    assert record["decision_source"] == "interactive"
+    assert record["approval"] == {
+        "provider": "synthetic-dialog",
+        "status": status,
+        "mode": "native-gap",
+        "permission_mode": "bypassPermissions",
+        "origin": "policy",
+    }
 
 
 def test_full_body_preserves_newlines(audit_body_cfg, tmp_path: Path):

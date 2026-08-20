@@ -15,6 +15,7 @@
   - cmd_digest/cmd_chars/cmd_lines：默认保留的元数据
   - cmd_body/cmd_preview：仅 audit_include_body=true 时写入
   - hook_event：规范化事件名（若有）
+  - approval/decision_source：同步人工审批结果与最终决策来源（若有）
 """
 from __future__ import annotations
 
@@ -231,6 +232,11 @@ def _redact(text: str) -> str:
     return _redact_secrets(redact_user_paths(text or ""))
 
 
+def redact_text(text: str) -> str:
+    """脱敏供本机提示或审计展示的文本。"""
+    return _redact(text)
+
+
 def _ensure_private_dir(path: Path) -> bool:
     created = False
     try:
@@ -438,6 +444,8 @@ def write(
     dry_run: bool | None = None,
     classification: str | None = None,
     review: dict[str, Any] | None = None,
+    approval: dict[str, Any] | None = None,
+    decision_source: str | None = None,
 ) -> None:
     """写入一条审计。decision 保持旧语义；engine/rendered 为优化用显式字段。"""
     if disabled():
@@ -480,6 +488,10 @@ def write(
         record["classification"] = classification
     if review:
         record["review"] = _redact_value(review)
+    if approval:
+        record["approval"] = _redact_value(approval)
+    if decision_source:
+        record["decision_source"] = safe_identifier(decision_source)
     if is_dry:
         record["dry_run"] = True
     if error_type:
@@ -510,6 +522,8 @@ def record_evaluation(
     error_detail: str | None = None,
     classification: str | None = None,
     review: dict[str, Any] | None = None,
+    approval: dict[str, Any] | None = None,
+    decision_source: str | None = None,
 ) -> None:
     """evaluate + render 之后的统一落盘入口。"""
     eng = engine_decision
@@ -547,4 +561,6 @@ def record_evaluation(
         error_detail=error_detail,
         classification=classification,
         review=review,
+        approval=approval,
+        decision_source=decision_source,
     )

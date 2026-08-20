@@ -78,6 +78,11 @@ fail_open = false
 
 dry_run = false
 
+# Codex PreToolUse medium ask 的本机同步审批：off / native-gap / always。
+# native-gap 只在 Codex permission_mode 为 dontAsk / bypassPermissions 时弹框。
+codex_approval_mode = "off"
+codex_approval_timeout_seconds = 25
+
 # 默认只记录摘要元数据，不写命令、补丁或文件正文。
 audit_include_body = false
 
